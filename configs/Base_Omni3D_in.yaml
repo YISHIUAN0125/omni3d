@@ -3,12 +3,12 @@ SOLVER:
   TYPE: "sgd"
   IMS_PER_BATCH: 8
   BASE_LR: 0.005 
-  STEPS: (69600, 92800)       
-  MAX_ITER: 116000            
-  WARMUP_ITERS: 3625
+  STEPS: (22000, 30250)       
+  MAX_ITER: 33000            
+  WARMUP_ITERS: 1031
 TEST:
-  EVAL_PERIOD: 29000
-VIS_PERIOD: 2320
+  EVAL_PERIOD: 3300
+VIS_PERIOD: 1000
 DATASETS:
   # TRAIN: ('SUNRGBD_train', 'SUNRGBD_val', 'Hypersim_train', 'Hypersim_val', 'ARKitScenes_train', 'ARKitScenes_val')
   # TEST: ('SUNRGBD_test', 'Hypersim_test', 'ARKitScenes_test') 
