@@ -34,10 +34,6 @@ DENSE_CUBE_HEAD_REGISTRY = Registry("DENSE_CUBE_HEAD")
 
 
 class Scale(nn.Module):
-    """
-    用於 2D 邊界框迴歸的分層可學習縮放因子（FCOS 風格）。
-    允許每個 FPN 特徵層級自適應調整迴歸 offsets 的尺度範圍。
-    """
     def __init__(self, init_value: float = 1.0):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
@@ -48,11 +44,6 @@ class Scale(nn.Module):
 
 @DENSE_CUBE_HEAD_REGISTRY.register()
 class DenseCubeHead(nn.Module):
-    """
-    單階段 Dense 3D 邊界框預測頭（Cube R-CNN Single-Stage 版）。
-    省去 RPN 與 RoIAlign，在多尺度特徵圖上密集預測 2D 框、Centerness、分類機率，
-    以及 3D 方體參數（XY 投影偏移、深度 Z、3D 尺寸、3D 旋轉姿態與不確定性信心度）。
-    """
 
     @configurable
     def __init__(

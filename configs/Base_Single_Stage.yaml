@@ -90,7 +90,7 @@ MODEL:
     LOSS_W_JOINT: 1.0        # 3D 組合邊界框 Joint loss 權重
 
     # --- 3D 幾何與先驗設定 (與原版 Cube R-CNN 對齊) ---
-    Z_TYPE: "log"            # 深度迴歸空間 ('log', 'direct', 'sigmoid', 'clusters')
+    Z_TYPE: "direct"            # 深度迴歸空間 ('log', 'direct', 'sigmoid', 'clusters')
     DIMS_PRIORS_ENABLED: True  # 是否使用各類別 3D 尺寸先驗
     DIMS_PRIORS_FUNC: "exp"  # 尺寸先驗解碼函式 ('exp', 'sigmoid')
     CHAMFER_POSE: True       # 旋轉與 Joint 損失是否採用 Chamfer 距離
@@ -101,7 +101,7 @@ MODEL:
     VIRTUAL_FOCAL: 512.0     # 虛擬相機參考焦距
 
     # --- 推論與 NMS 設定 ---
-    SCORE_THRESH_TEST: 0.05
+    SCORE_THRESH_TEST: 0.01
     TOPK_CANDIDATES_TEST: 1000
-    NMS_THRESH_TEST: 0.5
+    NMS_THRESH_TEST: 0.6
     MAX_DETECTIONS_PER_IMAGE: 100

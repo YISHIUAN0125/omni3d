@@ -41,13 +41,15 @@ MODEL:
   DLA:
     TYPE: 'dla34'
   FPN:
-    IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    # IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
   ANCHOR_GENERATOR:
-    SIZES: [[32], [64], [128], [256], [512]]  # One size for each in feature map
+    SIZES: [[64], [128], [256], [512]]  # One size for each in feature map
     ASPECT_RATIOS: [[0.5, 1.0, 2.0]]  # Three aspect ratios (same for all in feature maps)
   RPN:
     HEAD_NAME: "StandardRPNHead"
-    IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    # IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
     PRE_NMS_TOPK_TRAIN: 2000  # Per FPN level
     PRE_NMS_TOPK_TEST: 1000  # Per FPN level
     POST_NMS_TOPK_TRAIN: 1000
@@ -60,7 +62,8 @@ MODEL:
     NAME: "RPNWithIgnore"
   ROI_HEADS:
     NAME: "ROIHeads3D"
-    IN_FEATURES: ["p2", "p3", "p4", "p5", 'p6']
+    # IN_FEATURES: ["p2", "p3", "p4", "p5", 'p6']
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
     BATCH_SIZE_PER_IMAGE: 512
     SCORE_THRESH_TEST: 0.01
     NUM_CLASSES: 43
