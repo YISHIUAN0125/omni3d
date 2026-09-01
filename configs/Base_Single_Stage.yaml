@@ -1,0 +1,107 @@
+SOLVER:
+  TYPE: "sgd"
+  IMS_PER_BATCH: 32
+  BASE_LR: 0.02
+  STEPS: (19200, 25600)
+  MAX_ITER: 32000
+  WEIGHT_DECAY: 0.0001
+  LR_SCHEDULER_NAME: "WarmupMultiStepLR"
+
+
+INPUT:
+  FORMAT: "BGR"
+  MIN_SIZE_TRAIN: (256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640)
+  MIN_SIZE_TEST: 512
+  MAX_SIZE_TRAIN: 4096
+  MAX_SIZE_TEST: 4096
+
+TEST:
+  VISIBILITY_THRES: 0.33333333
+  TRUNCATION_THRES: 0.33333333
+  EVAL_PERIOD: 16000
+
+DATASETS:
+  TRAIN: ('KITTI_train', 'KITTI_val')
+  TEST: ('KITTI_test',) 
+  CATEGORY_NAMES: ('pedestrian', 'car', 'cyclist', 'van', 'truck', 'tram', 'person')
+  IGNORE_NAMES: "['dontcare', 'ignore', 'void']"
+  MIN_HEIGHT_THRES: 0.05
+  TRUNCATION_THRES: 0.75
+  VISIBILITY_THRES: 0.25
+  TRUNC_2D_BOXES: True
+
+VIS_PERIOD: 640
+
+DATALOADER:
+  SAMPLER_TRAIN: "RepeatFactorTrainingSampler"
+  REPEAT_THRESHOLD: 0.1
+
+MODEL:
+  PIXEL_MEAN: [103.530, 116.280, 123.675]
+  PIXEL_STD: [57.375, 57.120, 58.395]
+  META_ARCHITECTURE: "DenseCube3D"  # 對應 dense_cube.py 中註冊的架構名稱
+  MASK_ON: False
+  STABILIZE: 0.02
+  USE_BN: True
+
+  BACKBONE:
+    FREEZE_AT: 0
+    NAME: 'build_dla_from_vision_fpn_backbone'
+
+  DLA:
+    TYPE: 'dla34'
+
+  FPN:
+    IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    # IN_FEATURES: ['p2', 'p3', 'p4']
+
+  # -------------------------------------------------------------------
+  # Single-Stage Dense Cube Head & Assigner Configuration
+  # -------------------------------------------------------------------
+  DENSE_HEAD:
+    NAME: "DenseCubeHead"
+    IN_FEATURES: ['p2', 'p3', 'p4']
+    NUM_CLASSES: 7           # 與 CATEGORY_NAMES 類別數量保持一致
+    NUM_CONVS: 4             # 卷積塔層數
+    CONV_DIM: 256            # 卷積通道數
+    POSE_TYPE: "6d"          # 3D 旋轉表示法 ('6d', 'quaternion', 'euler')
+    USE_CONFIDENCE: True     # 是否預測 3D uncertainty 並用於 loss 與推論加權
+    CLUSTER_BINS: 1          # 深度多 bin 分配 (若無 pre-computed clusters 請設為 1)
+    PRIOR_PROB: 0.01         # Focal loss 初始化前景先驗機率
+    FOCAL_ALPHA: 0.25        # Focal loss alpha
+    FOCAL_GAMMA: 2.0         # Focal loss gamma
+
+    # --- SimOTA Assigner 設定 (assigner.py) ---
+    ASSIGNER: "SimOTAAssigner"
+    CENTER_RADIUS: 2.5       # 中心先驗採樣半徑
+    CANDIDATE_TOPK: 10       # 動態 K 動態匹配候選數
+    CLS_COST_WEIGHT: 1.0     # 匹配代價矩陣分類權重
+    IOU_COST_WEIGHT: 3.0     # 匹配代價矩陣 2D IoU 權重
+
+    # --- 損失權重設定 ---
+    LOSS_W_3D: 1.0           # 3D 總體損失縮放倍率
+    LOSS_W_CLS: 1.0          # 分類 Focal loss 權重
+    LOSS_W_BOX2D: 1.0        # 2D 框 GIoU loss 權重
+    LOSS_W_CENTERNESS: 1.0   # Centerness BCE loss 權重
+    LOSS_W_XY: 1.0           # 3D 投影中心 XY loss 權重
+    LOSS_W_Z: 1.0            # 3D 深度 Z loss 權重
+    LOSS_W_DIMS: 1.0         # 3D 尺寸 Dimensions loss 權重
+    LOSS_W_POSE: 1.0         # 3D 旋轉姿態 Pose loss 權重
+    LOSS_W_JOINT: 1.0        # 3D 組合邊界框 Joint loss 權重
+
+    # --- 3D 幾何與先驗設定 (與原版 Cube R-CNN 對齊) ---
+    Z_TYPE: "log"            # 深度迴歸空間 ('log', 'direct', 'sigmoid', 'clusters')
+    DIMS_PRIORS_ENABLED: True  # 是否使用各類別 3D 尺寸先驗
+    DIMS_PRIORS_FUNC: "exp"  # 尺寸先驗解碼函式 ('exp', 'sigmoid')
+    CHAMFER_POSE: True       # 旋轉與 Joint 損失是否採用 Chamfer 距離
+    DISENTANGLED_LOSS: True  # 啟用 3D 變數解耦損失
+    INVERSE_Z_WEIGHT: True   # 啟用反深度加權 (提升近處物件權重)
+    ALLOCENTRIC_POSE: True   # 預測視線相關的 Allocentric 姿態
+    VIRTUAL_DEPTH: True      # 啟用虛擬相機投影尺度縮放
+    VIRTUAL_FOCAL: 512.0     # 虛擬相機參考焦距
+
+    # --- 推論與 NMS 設定 ---
+    SCORE_THRESH_TEST: 0.05
+    TOPK_CANDIDATES_TEST: 1000
+    NMS_THRESH_TEST: 0.5
+    MAX_DETECTIONS_PER_IMAGE: 100
