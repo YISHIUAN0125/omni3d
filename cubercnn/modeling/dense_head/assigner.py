@@ -48,7 +48,7 @@ class SimOTAAssigner:
 
         # Points in box 
         is_in_boxes, is_in_centers = self._get_geometry_constraint(points, strides, gt_boxes_i)
-        is_in_boxes_and_centers = is_in_boxes & is_in_centers # TODO Use & or |
+        is_in_boxes_and_centers = is_in_boxes | is_in_centers # TODO Use & or |
         candidate_mask = is_in_boxes_and_centers.any(dim=1)
 
         if candidate_mask.sum() == 0:
