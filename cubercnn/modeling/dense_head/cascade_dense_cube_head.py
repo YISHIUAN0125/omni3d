@@ -23,7 +23,7 @@ from pytorch3d.transforms import (
 )
 from pytorch3d.transforms.so3 import so3_relative_angle
 
-from cubercnn.modeling.dense_head.assigner import build_assigner, SimOTAAssigner
+from cubercnn.modeling.dense_head.assigner import build_assigner, SimOTAAssigner, build_tal_assigner, TaskAlignedAssigner
 from cubercnn.modeling.roi_heads.cube_head import build_cube_head
 from cubercnn import util
 
@@ -34,6 +34,20 @@ SQRT_2_CONSTANT = 1.41421356
 
 CASCADE_DENSE_CUBE_HEAD_REGISTRY = Registry("CASCADE_DENSE_CUBE_HEAD")
 
+
+def quality_focal_loss(pred_logits: torch.Tensor, target_scores: torch.Tensor, beta: float = 2.0, reduction: str = "sum"):
+    pred_sigmoid = pred_logits.sigmoid()
+    
+    # |y - sigma|^beta
+    scale_factor = (pred_sigmoid - target_scores).abs().pow(beta)
+    bce_loss = F.binary_cross_entropy_with_logits(pred_logits, target_scores, reduction="none")
+    loss = scale_factor * bce_loss
+    
+    if reduction == "sum":
+        return loss.sum()
+    elif reduction == "mean":
+        return loss.mean()
+    return loss
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1):
@@ -60,7 +74,7 @@ class CascadeDenseCubeHead(nn.Module):
         prior_prob: float,
         focal_alpha: float,
         focal_gamma: float,
-        assigner: SimOTAAssigner,  
+        assigner: TaskAlignedAssigner,  
         cube_head: nn.Module,
         cube_pooler: nn.Module,
         loss_w_3d: float,
@@ -211,6 +225,7 @@ class CascadeDenseCubeHead(nn.Module):
             "focal_alpha": cfg.MODEL.DENSE_HEAD.FOCAL_ALPHA,
             "focal_gamma": cfg.MODEL.DENSE_HEAD.FOCAL_GAMMA,
             "assigner": build_assigner(cfg),
+            # "assigner": build_tal_assigner(cfg),
             "cube_head": cube_head,
             "cube_pooler": cube_pooler,
             "loss_w_cls": cfg.MODEL.DENSE_HEAD.LOSS_W_CLS,
@@ -662,7 +677,7 @@ class CascadeDenseCubeHead(nn.Module):
         N = cls_logits.shape[0]
         device = cls_logits.device
 
-        all_labels, all_gt_inds = [], []
+        all_labels, all_gt_inds, all_target_scores = [], [], []
         gt_boxes3D_valid_list, gt_poses_valid_list, gt_box2d_valid_list = [], [], []
 
         for i in range(N):
@@ -683,8 +698,24 @@ class CascadeDenseCubeHead(nn.Module):
                 cls_logits[i].detach(), box_preds_i, points_all, strides_all,
                 gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
             )
+            # labels_i, gt_inds_i, target_score_i = self.assigner.assign(
+            #     cls_logits[i].detach(), box_preds_i, points_all, strides_all,
+            #     gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
+            # )
+
+            # ==========================================
+            # [新增 DEBUG 區塊] 檢查標籤分配狀況
+            # ==========================================
+            # fg_mask_i = (labels_i >= 0) & (labels_i < self.num_classes)
+            # if fg_mask_i.sum() > 0:
+            #     print(f"\n[Iter Debug] Image {i} ---")
+            #     print("1. 真實物件類別 (GT):", gt_labels_i.tolist())
+            #     print("2. Assigner 分配的前景類別:", labels_i[fg_mask_i].tolist())
+            #     print("3. Target Score 最大值:", target_score_i[fg_mask_i].max(dim=-1)[0].mean().item())
+            # ==========================================
             all_labels.append(labels_i)
             all_gt_inds.append(gt_inds_i)
+            # all_target_scores.append(target_score_i)
 
         gt_labels = torch.stack(all_labels)
         gt_gt_inds = torch.stack(all_gt_inds)
@@ -700,11 +731,17 @@ class CascadeDenseCubeHead(nn.Module):
         cls_target = torch.zeros_like(cls_logits)
         pos_labels = gt_labels[fg_mask]
         cls_target[fg_mask] = F.one_hot(pos_labels, self.num_classes).float()
+        # cls_target = torch.stack(all_target_scores)
 
         loss_cls = sigmoid_focal_loss_jit(
             cls_logits[valid_mask], cls_target[valid_mask],
             alpha=self.focal_alpha, gamma=self.focal_gamma, reduction="sum",
         ) / num_fg
+
+        # loss_cls = quality_focal_loss(
+        #     cls_logits[valid_mask], cls_target[valid_mask],
+        #     beta=self.focal_gamma, reduction="sum",
+        # ) / num_fg
 
         losses = {"DenseCube/loss_cls": loss_cls * self.loss_w_cls}
 

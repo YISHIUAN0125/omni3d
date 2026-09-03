@@ -8,6 +8,7 @@ from detectron2.utils.memory import retry_if_cuda_oom
 from detectron2.utils.registry import Registry
 
 SIMOTA_ASSIGNER_REGISTRY = Registry("SIMOTA_ASSIGNER")
+TASKALIGNED_ASSIGNER_REGISTRY = Registry("TASKALIGNED_ASSIGNER")
 
 def build_assigner(cfg):
     name = cfg.MODEL.DENSE_HEAD.ASSIGNER
@@ -138,6 +139,141 @@ class SimOTAAssigner:
         # Marks background points that fall inside a 'dontcare' GT box as ignore (-1)
         if gt_boxes_ign_i is None or gt_boxes_ign_i.shape[0] == 0:
             return
+        bg_mask = assigned_labels == self.num_classes
+        if bg_mask.sum() == 0:
+            return
+        
+        bg_idx = bg_mask.nonzero(as_tuple=True)[0]
+
+        px = points[bg_idx, 0].unsqueeze(1)
+        py = points[bg_idx, 1].unsqueeze(1)
+
+        inside = (
+            (px >= gt_boxes_ign_i[:, 0].unsqueeze(0))
+            & (px <= gt_boxes_ign_i[:, 2].unsqueeze(0))
+            & (py >= gt_boxes_ign_i[:, 1].unsqueeze(0))
+            & (py <= gt_boxes_ign_i[:, 3].unsqueeze(0))
+        )
+
+        assigned_labels[bg_idx[inside.any(dim=1)]] = -1
+
+
+def build_tal_assigner(cfg):
+    name = cfg.MODEL.DENSE_HEAD.ASSIGNER
+    return TASKALIGNED_ASSIGNER_REGISTRY.get(name)(cfg)
+
+@TASKALIGNED_ASSIGNER_REGISTRY.register()
+class TaskAlignedAssigner:
+    def __init__(self, cfg):
+        self.num_classes = cfg.MODEL.DENSE_HEAD.NUM_CLASSES
+        self.topk = getattr(cfg.MODEL.DENSE_HEAD, "TAL_TOPK", 13)
+        self.alpha = getattr(cfg.MODEL.DENSE_HEAD, "TAL_ALPHA", 1.0)
+        self.beta = getattr(cfg.MODEL.DENSE_HEAD, "TAL_BETA", 6.0)
+        self.eps = 1e-9
+
+    @torch.no_grad()
+    def assign(self,
+               cls_preds_i: torch.Tensor,
+               box_preds_i: torch.Tensor,
+               points: torch.Tensor,
+               strides: torch.Tensor,
+               gt_boxes_i: torch.Tensor,
+               gt_labels_i: torch.Tensor,
+               gt_boxes_ign_i: Optional[torch.Tensor] = None,
+               obj_preds_i: Optional[torch.Tensor] = None,
+               ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+        num_points = points.shape[0]
+        device = points.device
+
+        assigned_labels = torch.full((num_points,), self.num_classes, dtype=torch.long, device=device)
+        assigned_gt_inds = torch.full((num_points,), -1, dtype=torch.long, device=device)
+        target_scores = torch.zeros((num_points, self.num_classes), dtype=torch.float32, device=device)
+
+        num_gt = gt_boxes_i.shape[0]
+        if num_gt == 0:
+            self._apply_ignore(assigned_labels, points, gt_boxes_ign_i)
+            return assigned_labels, assigned_gt_inds, target_scores
+
+        is_in_gts = self._get_geometry_constraint(points, gt_boxes_i)
+        candidate_mask = is_in_gts.any(dim=1)
+
+        if candidate_mask.sum() == 0:
+            self._apply_ignore(assigned_labels, points, gt_boxes_ign_i)
+            return assigned_labels, assigned_gt_inds, target_scores
+
+        cand_idx = candidate_mask.nonzero(as_tuple=True)[0]
+        cls_preds_c = cls_preds_i[cand_idx].sigmoid()
+        box_preds_c = box_preds_i[cand_idx]
+        is_in_gts_c = is_in_gts[cand_idx]
+
+        pair_iou = retry_if_cuda_oom(pairwise_iou)(Boxes(box_preds_c), Boxes(gt_boxes_i)).clamp_(0)
+
+        bbox_scores = cls_preds_c[:, gt_labels_i] 
+        if obj_preds_i is not None:
+            obj_preds_c = obj_preds_i[cand_idx].sigmoid()
+            bbox_scores *= obj_preds_c
+
+        align_metric = (bbox_scores.pow(self.alpha)) * (pair_iou.pow(self.beta))
+        align_metric *= is_in_gts_c
+
+        topk = min(self.topk, align_metric.shape[0])
+        topk_metrics, topk_idxs = torch.topk(align_metric, topk, dim=0, largest=True) 
+
+        matching_matrix = torch.zeros_like(align_metric, dtype=torch.uint8)
+        valid_mask = topk_metrics > self.eps
+        for gt_idx in range(num_gt):
+            valid_cand_idxs = topk_idxs[:, gt_idx][valid_mask[:, gt_idx]]
+            matching_matrix[valid_cand_idxs, gt_idx] = 1
+
+        fg_mask_c = matching_matrix.sum(1) > 0
+        if matching_matrix.sum(1).max() > 1:
+            _, max_gt_idx = align_metric.max(dim=1) 
+            matching_matrix.zero_()
+            matching_matrix[fg_mask_c, max_gt_idx[fg_mask_c]] = 1
+
+        # -------------------------------------------------------------
+        # 產生正規化的 Target Score (Soft Label)
+        # -------------------------------------------------------------
+        align_metric *= matching_matrix
+        pos_align_metrics = align_metric.max(dim=0, keepdim=True)[0]
+        overlaps = pair_iou * matching_matrix
+        pos_overlaps = overlaps.max(dim=0, keepdim=True)[0]
+
+        # norm_align_metric = align_metric * pos_overlaps / (pos_align_metrics + self.eps)
+        norm_align_metric = align_metric * pos_overlaps.clamp(min=0.5) / (pos_align_metrics + self.eps)
+        cand_scores = norm_align_metric.max(dim=1)[0] # (P_cand,)
+
+        matched_gt_inds_c = matching_matrix.argmax(1) 
+        fg_mask_c = matching_matrix.sum(1) > 0        
+
+        fg_global_idx = cand_idx[fg_mask_c]
+        matched_gts = matched_gt_inds_c[fg_mask_c]
+
+        assigned_labels[fg_global_idx] = gt_labels_i[matched_gts]
+        assigned_gt_inds[fg_global_idx] = matched_gts
+
+        target_scores[fg_global_idx, gt_labels_i[matched_gts]] = cand_scores[fg_mask_c]
+
+        self._apply_ignore(assigned_labels, points, gt_boxes_ign_i)
+
+        return assigned_labels, assigned_gt_inds, target_scores
+
+    def _get_geometry_constraint(self, points, gt_boxes_i):
+        x, y = points[:, 0].unsqueeze(1), points[:, 1].unsqueeze(1) 
+
+        l = x - gt_boxes_i[:, 0].unsqueeze(0)
+        t = y - gt_boxes_i[:, 1].unsqueeze(0)
+        r = gt_boxes_i[:, 2].unsqueeze(0) - x
+        b = gt_boxes_i[:, 3].unsqueeze(0) - y
+        
+        is_in_boxes = torch.stack([l, t, r, b], dim=-1).min(-1)[0] > 0 
+        return is_in_boxes
+
+    def _apply_ignore(self, assigned_labels, points, gt_boxes_ign_i):
+        if gt_boxes_ign_i is None or gt_boxes_ign_i.shape[0] == 0:
+            return
+            
         bg_mask = assigned_labels == self.num_classes
         if bg_mask.sum() == 0:
             return
