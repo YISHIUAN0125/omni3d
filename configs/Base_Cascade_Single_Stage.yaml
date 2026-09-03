@@ -1,0 +1,83 @@
+SOLVER:
+  TYPE: "sgd"
+  IMS_PER_BATCH: 32
+  BASE_LR: 0.02
+  STEPS: (19200, 25600)
+  MAX_ITER: 32000
+  WEIGHT_DECAY: 0.0001
+  LR_SCHEDULER_NAME: "WarmupMultiStepLR"
+INPUT:
+  MIN_SIZE_TRAIN: (256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640,)
+  MIN_SIZE_TEST: 512
+  MAX_SIZE_TRAIN: 4096
+  MAX_SIZE_TEST: 4096
+TEST:
+  VISIBILITY_THRES: 0.33333333
+  TRUNCATION_THRES: 0.33333333
+  EVAL_PERIOD: 16000
+DATASETS:
+  TRAIN: ('KITTI_train', 'KITTI_val')
+  TEST: ('KITTI_test',) 
+  CATEGORY_NAMES: ('pedestrian', 'car', 'cyclist', 'van', 'truck', 'tram', 'person')
+  IGNORE_NAMES: "['dontcare', 'ignore', 'void']"
+  MIN_HEIGHT_THRES: 0.05
+  TRUNCATION_THRES: 0.75
+  VISIBILITY_THRES: 0.25
+  TRUNC_2D_BOXES: True
+VIS_PERIOD: 640
+DATALOADER:
+  SAMPLER_TRAIN: "RepeatFactorTrainingSampler"
+  REPEAT_THRESHOLD: 0.1
+MODEL:
+  PIXEL_MEAN: [103.530, 116.280, 123.675]
+  PIXEL_STD: [57.375, 57.120, 58.395]
+  META_ARCHITECTURE: "DenseCube3D"
+  MASK_ON: False
+  STABILIZE: 0.02
+  USE_BN: True
+  BACKBONE:
+    FREEZE_AT: 0
+    NAME: 'build_dla_from_vision_fpn_backbone'
+  DLA:
+    TYPE: 'dla34'
+  FPN:
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
+  ROI_CUBE_HEAD:
+    LOSS_W_3D: 1.0
+    LOSS_W_XY: 1.0
+    LOSS_W_Z: 1.0
+    LOSS_W_DIMS: 1.0
+    LOSS_W_POSE: 1.0
+    LOSS_W_JOINT: 0.1
+    CLUSTER_BINS: 1
+    POSE_TYPE: "6d"       
+    USE_CONFIDENCE: 1.0
+    Z_TYPE: "direct"
+    DIMS_PRIORS_ENABLED: True  
+    DIMS_PRIORS_FUNC: None
+    CHAMFER_POSE: True       
+    DISENTANGLED_LOSS: True  
+    INVERSE_Z_WEIGHT: True   
+    ALLOCENTRIC_POSE: True   
+    VIRTUAL_DEPTH: True     
+    VIRTUAL_FOCAL: 512.0
+  DENSE_HEAD:
+    NAME: "CascadeDenseCubeHead"
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
+    NUM_CLASSES: 7
+    NUM_CONVS: 4            
+    CONV_DIM: 256 
+    PRIOR_PROB: 0.01
+    FOCAL_ALPHA: 0.25
+    FOCAL_GAMMA: 2.0
+    ASSIGNER: "SimOTAAssigner"
+    CENTER_RADIUS: 1.5
+    CANDIDATE_TOPK: 10
+    LOSS_W_CLS: 1.0
+    LOSS_W_BOX2D: 1.0
+    CLS_COST_WEIGHT: 1.0
+    IOU_COST_WEIGHT: 3.0
+    SCORE_THRESH_TEST: 0.05
+    TOPK_CANDIDATES_TEST: 1000
+    NMS_THRESH_TEST: 0.5
+    MAX_DETECTIONS_PER_IMAGE: 100

@@ -33,17 +33,30 @@ SQRT_2_CONSTANT = 1.41421356
 DENSE_CUBE_HEAD_REGISTRY = Registry("DENSE_CUBE_HEAD")
 
 
-class Scale(nn.Module):
-    def __init__(self, init_value: float = 1.0):
+class ConvBlock(nn.Module):
+    """
+    YOLOv8 風格基本卷積模組: Conv2d + GroupNorm + SiLU (或 ReLU)
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
-        self.scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
+        self.norm = nn.GroupNorm(32, out_channels)
+        self.act = nn.SiLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.scale
+        return self.act(self.norm(self.conv(x)))
 
 
 @DENSE_CUBE_HEAD_REGISTRY.register()
 class DenseCubeHead(nn.Module):
+    """
+    YOLOv8-Style Decoupled Dense 3D Bounding Box Head.
+    完全採用 YOLOv8 的解耦結構設計:
+    1. 移除 Centerness 與 Scale 模組，各特徵層級 (FPN Levels) 採用獨立專屬的卷積頭 (Per-level Decoupled Towers)。
+    2. 採用 3x3 空間特徵卷積 + 1x1 預測投射頭。
+    3. 推論時直接以純粹的 Classification Sigmoid 作為置信度，大幅提升高置信度並壓制邊緣雜框。
+    4. 完整保留 Cube R-CNN 的 3D 幾何解碼、先驗轉換與 Joint Loss 計算。
+    """
 
     @configurable
     def __init__(
@@ -60,11 +73,10 @@ class DenseCubeHead(nn.Module):
         prior_prob: float,
         focal_alpha: float,
         focal_gamma: float,
-        assigner: SimOTAAssigner,
+        assigner: SimOTAAssigner, #TODO use yolo TAL in the future
         loss_w_3d: float,
         loss_w_cls: float,
         loss_w_box2d: float,
-        loss_w_center: float,
         loss_w_xy: float,
         loss_w_z: float,
         loss_w_dims: float,
@@ -90,6 +102,7 @@ class DenseCubeHead(nn.Module):
         self.num_classes = num_classes
         self.in_features = in_features
         self.fpn_strides = fpn_strides
+        self.num_levels = len(in_features)
         self.pose_type = pose_type
         self.use_conf = use_conf
         self.cluster_bins = max(cluster_bins, 1)
@@ -99,7 +112,6 @@ class DenseCubeHead(nn.Module):
         self.loss_w_3d = loss_w_3d
         self.loss_w_cls = loss_w_cls
         self.loss_w_box2d = loss_w_box2d
-        self.loss_w_center = loss_w_center
         self.loss_w_xy = loss_w_xy
         self.loss_w_z = loss_w_z
         self.loss_w_dims = loss_w_dims
@@ -151,25 +163,8 @@ class DenseCubeHead(nn.Module):
                 self.priors_z_stats = nn.Parameter(priors_z_stats)
 
         # -------------------------------------------------------------
-        # 卷積特徵提取塔 (Convolutional Towers)
+        # YOLOv8 風格解耦卷積塔 (Per-Level Independent Towers)
         # -------------------------------------------------------------
-        self.cls_tower = self._make_tower(conv_dim, num_convs)
-        self.box2d_tower = self._make_tower(conv_dim, num_convs)
-        self.cube_tower = self._make_tower(conv_dim, num_convs)
-
-        # -------------------------------------------------------------
-        # 密集預測輸出分支 (Dense Prediction Heads)
-        # -------------------------------------------------------------
-        self.cls_score = nn.Conv2d(conv_dim, num_classes, 3, padding=1)
-        self.centerness = nn.Conv2d(conv_dim, 1, 3, padding=1)
-        self.box2d_reg = nn.Conv2d(conv_dim, 4, 3, padding=1)
-        self.scales = nn.ModuleList([Scale(1.0) for _ in fpn_strides])
-
-        # 3D 方體預測頭 (類別共享特徵結構)
-        self.cube_2d_deltas = nn.Conv2d(conv_dim, 2, 3, padding=1)
-        self.cube_dims = nn.Conv2d(conv_dim, 3, 3, padding=1)
-        self.cube_z = nn.Conv2d(conv_dim, self.cluster_bins, 3, padding=1)
-
         if pose_type == '6d':
             pose_ch = 6
         elif pose_type == 'quaternion':
@@ -178,32 +173,66 @@ class DenseCubeHead(nn.Module):
             pose_ch = 3
         else:
             raise ValueError(f'不支援的 3D 姿態類型: {pose_type}')
-        self.cube_pose = nn.Conv2d(conv_dim, pose_ch, 3, padding=1)
 
+        self.cls_towers = nn.ModuleList()
+        self.box2d_towers = nn.ModuleList()
+        self.cube_towers = nn.ModuleList()
+
+        # 各層專屬 1x1 預測頭 (Pred Heads)
+        self.cls_preds = nn.ModuleList()
+        self.box2d_preds = nn.ModuleList()
+        self.cube_2d_deltas_preds = nn.ModuleList()
+        self.cube_dims_preds = nn.ModuleList()
+        self.cube_z_preds = nn.ModuleList()
+        self.cube_pose_preds = nn.ModuleList()
         if self.use_conf:
-            self.cube_uncert = nn.Conv2d(conv_dim, 1, 3, padding=1)
+            self.cube_uncert_preds = nn.ModuleList()
+
+        for _ in range(self.num_levels):
+            # 2D 分類分支
+            self.cls_towers.append(self._make_tower(conv_dim, num_convs))
+            self.cls_preds.append(nn.Conv2d(conv_dim, num_classes, 1))
+
+            # 2D 邊界框迴歸分支 (l, t, r, b)
+            self.box2d_towers.append(self._make_tower(conv_dim, num_convs))
+            self.box2d_preds.append(nn.Conv2d(conv_dim, 4, 1))
+
+            # 3D 方體參數迴歸分支
+            self.cube_towers.append(self._make_tower(conv_dim, num_convs))
+            self.cube_2d_deltas_preds.append(nn.Conv2d(conv_dim, 2, 1))
+            self.cube_dims_preds.append(nn.Conv2d(conv_dim, 3, 1))
+            self.cube_z_preds.append(nn.Conv2d(conv_dim, self.cluster_bins, 1))
+            self.cube_pose_preds.append(nn.Conv2d(conv_dim, pose_ch, 1))
+            if self.use_conf:
+                self.cube_uncert_preds.append(nn.Conv2d(conv_dim, 1, 1))
 
         self._init_weights(prior_prob)
 
     def _make_tower(self, conv_dim: int, num_convs: int) -> nn.Sequential:
         layers = []
         for _ in range(num_convs):
-            conv = nn.Conv2d(conv_dim, conv_dim, 3, padding=1)
-            weight_init.c2_xavier_fill(conv)
-            layers.append(conv)
-            layers.append(nn.GroupNorm(32, conv_dim))
-            layers.append(nn.ReLU())
+            layers.append(ConvBlock(conv_dim, conv_dim, kernel_size=3, padding=1))
         return nn.Sequential(*layers)
 
     def _init_weights(self, prior_prob: float):
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        nn.init.constant_(self.cls_score.bias, bias_value)
-        for m in [self.cube_2d_deltas, self.cube_dims, self.cube_pose, self.cube_z]:
-            nn.init.normal_(m.weight, std=0.001)
-            nn.init.constant_(m.bias, 0)
+        for cls_pred in self.cls_preds:
+            nn.init.constant_(cls_pred.bias, bias_value)
+            nn.init.normal_(cls_pred.weight, std=0.01)
+
+        for box_pred in self.box2d_preds:
+            nn.init.normal_(box_pred.weight, std=0.01)
+            nn.init.constant_(box_pred.bias, 0.0)
+
+        for m_list in [self.cube_2d_deltas_preds, self.cube_dims_preds, self.cube_pose_preds, self.cube_z_preds]:
+            for m in m_list:
+                nn.init.normal_(m.weight, std=0.001)
+                nn.init.constant_(m.bias, 0.0)
+
         if self.use_conf:
-            nn.init.normal_(self.cube_uncert.weight, std=0.001)
-            nn.init.constant_(self.cube_uncert.bias, 5)
+            for uncert_pred in self.cube_uncert_preds:
+                nn.init.normal_(uncert_pred.weight, std=0.001)
+                nn.init.constant_(uncert_pred.bias, 5.0)
 
     @classmethod
     def from_config(cls, cfg, input_shape: Dict[str, ShapeSpec], priors: Optional[dict] = None):
@@ -224,7 +253,6 @@ class DenseCubeHead(nn.Module):
             "loss_w_3d": cfg.MODEL.DENSE_HEAD.LOSS_W_3D if hasattr(cfg.MODEL.DENSE_HEAD, "LOSS_W_3D") else 1.0,
             "loss_w_cls": cfg.MODEL.DENSE_HEAD.LOSS_W_CLS,
             "loss_w_box2d": cfg.MODEL.DENSE_HEAD.LOSS_W_BOX2D,
-            "loss_w_center": cfg.MODEL.DENSE_HEAD.LOSS_W_CENTERNESS,
             "loss_w_xy": cfg.MODEL.DENSE_HEAD.LOSS_W_XY,
             "loss_w_z": cfg.MODEL.DENSE_HEAD.LOSS_W_Z,
             "loss_w_dims": cfg.MODEL.DENSE_HEAD.LOSS_W_DIMS,
@@ -250,33 +278,33 @@ class DenseCubeHead(nn.Module):
     # 前向傳播 (Forward Pass)
     # ===================================================================
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, List[torch.Tensor]]:
-        cls_logits, centerness, box2d_reg = [], [], []
+        cls_logits, box2d_reg = [], []
         cube_deltas, cube_z, cube_dims, cube_pose, cube_uncert = [], [], [], [], []
 
         for level, f in enumerate(self.in_features):
             x = features[f]
-
-            cls_feat = self.cls_tower(x)
-            box_feat = self.box2d_tower(x)
-            cube_feat = self.cube_tower(x)
-
-            cls_logits.append(self.cls_score(cls_feat))
-            centerness.append(self.centerness(box_feat))
-            # ReLU 確保 2D 距離 offsets 非負，Scale 模組自適應調整各 FPN 層級尺度
-            # box2d_reg.append(F.relu(self.scales[level](self.box2d_reg(box_feat))))
             stride = self.fpn_strides[level]
-            box2d_reg.append(F.relu(self.scales[level](self.box2d_reg(box_feat))) * stride)
 
-            cube_deltas.append(self.cube_2d_deltas(cube_feat))
-            cube_z.append(self.cube_z(cube_feat))
-            cube_dims.append(self.cube_dims(cube_feat))
-            cube_pose.append(self.cube_pose(cube_feat))
+            # 2D 分類與邊界框迴歸 (YOLOv8 每層獨立塔)
+            cls_feat = self.cls_towers[level](x)
+            box_feat = self.box2d_towers[level](x)
+            cube_feat = self.cube_towers[level](x)
+
+            cls_logits.append(self.cls_preds[level](cls_feat))
+
+            # YOLOv8 邊界框距離預測直接乘以該層 Stride (無須 Scale 模組)
+            box2d_reg.append(F.relu(self.box2d_preds[level](box_feat)) * stride)
+
+            # 3D 方體參數預測 (1x1 Conv 投射)
+            cube_deltas.append(self.cube_2d_deltas_preds[level](cube_feat))
+            cube_z.append(self.cube_z_preds[level](cube_feat))
+            cube_dims.append(self.cube_dims_preds[level](cube_feat))
+            cube_pose.append(self.cube_pose_preds[level](cube_feat))
             if self.use_conf:
-                cube_uncert.append(self.cube_uncert(cube_feat).clamp(min=0.01))
+                cube_uncert.append(self.cube_uncert_preds[level](cube_feat).clamp(min=0.01))
 
         return {
             "cls_logits": cls_logits,
-            "centerness": centerness,
             "box2d_reg": box2d_reg,
             "cube_deltas": cube_deltas,
             "cube_z": cube_z,
@@ -289,9 +317,6 @@ class DenseCubeHead(nn.Module):
     # 幾何座標網格與輔助工具
     # ===================================================================
     def compute_locations(self, features: Dict[str, torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        計算所有 FPN 特徵層級的影像空間中心點座標 (x, y) 與對應 stride。
-        """
         locations = []
         strides_per_point = []
         for f, stride in zip(self.in_features, self.fpn_strides):
@@ -302,16 +327,12 @@ class DenseCubeHead(nn.Module):
             shift_y, shift_x = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
             shift_x = shift_x.reshape(-1)
             shift_y = shift_y.reshape(-1)
-            # 特徵感受野單元的中心點座標
             points = torch.stack((shift_x, shift_y), dim=1) + stride // 2
             locations.append(points)
             strides_per_point.append(torch.full((points.shape[0],), stride, dtype=torch.float32, device=device))
         return locations, strides_per_point
 
     def _decode_box2d(self, points: torch.Tensor, box2d_reg: torch.Tensor) -> torch.Tensor:
-        """
-        將中心點與 (l, t, r, b) 偏移量解碼為 (x1, y1, x2, y2) 2D 框座標。
-        """
         x1 = points[:, 0] - box2d_reg[:, 0]
         y1 = points[:, 1] - box2d_reg[:, 1]
         x2 = points[:, 0] + box2d_reg[:, 2]
@@ -319,14 +340,9 @@ class DenseCubeHead(nn.Module):
         return torch.stack([x1, y1, x2, y2], dim=1)
 
     def l1_loss(self, vals: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """與原版 Cube R-CNN 完全一致的 Smooth L1 損失 (beta=0.0 即為標準 L1)。"""
         return F.smooth_l1_loss(vals, target, reduction='none', beta=0.0)
 
     def chamfer_loss(self, vals: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        計算 3D 邊界框 8 個角點點集之間的雙向 Chamfer L1 距離。
-        vals, target 形狀: (B, 8, 3)
-        """
         B = vals.shape[0]
         xx = vals.view(B, 8, 1, 3)
         yy = target.view(B, 1, 8, 3)
@@ -334,7 +350,6 @@ class DenseCubeHead(nn.Module):
         return l1_dist.min(1).values.mean(-1) + l1_dist.min(2).values.mean(-1)
 
     def _safely_reduce(self, loss: torch.Tensor) -> torch.Tensor:
-        """過濾 NaN/Inf 數值以確保 Loss Reduce 過程數值穩定。"""
         valid = (~loss.isinf()) & (~loss.isnan())
         if valid.any():
             return loss[valid].mean()
@@ -362,7 +377,6 @@ class DenseCubeHead(nn.Module):
             return torch.cat([x.permute(0, 2, 3, 1).reshape(N, -1, C) for x in t], dim=1)
 
         cls_logits = flatten_level(outputs["cls_logits"])      # (N, P, C)
-        centerness = flatten_level(outputs["centerness"])      # (N, P, 1)
         box2d_reg = flatten_level(outputs["box2d_reg"])        # (N, P, 4)
         cube_deltas = flatten_level(outputs["cube_deltas"])    # (N, P, 2)
         cube_z_raw = flatten_level(outputs["cube_z"])          # (N, P, cluster_bins)
@@ -375,13 +389,25 @@ class DenseCubeHead(nn.Module):
 
         all_labels, all_gt_inds = [], []
 
-        # 對每張影像執行 SimOTA 正負樣本動態分配
+        # 用來組「僅含 valid GT」的逐圖清單，索引體系需與 assigner 回傳的 gt_inds 完全對齊
+        gt_boxes3D_valid_list = []
+        gt_poses_valid_list = []
+        gt_box2d_valid_list = []
+
         for i in range(N):
             gts_i = gt_instances[i]
             valid = gts_i.gt_classes >= 0
+
             gt_boxes_i = gts_i.gt_boxes.tensor[valid]
             gt_labels_i = gts_i.gt_classes[valid]
             gt_boxes_ign_i = gts_i.gt_boxes.tensor[~valid] if (~valid).any() else None
+
+            # 這三個 list 一定要用「同一個 valid mask」去篩，
+            # 順序要跟丟給 assigner 的 gt_boxes_i / gt_labels_i 完全一致，
+            # 這樣 assigner 回傳的 gt_inds（相對於 valid 子集的 index）才能直接拿來對應。
+            gt_boxes3D_valid_list.append(gts_i.gt_boxes3D[valid])
+            gt_poses_valid_list.append(gts_i.gt_poses[valid])
+            gt_box2d_valid_list.append(gts_i.gt_boxes.tensor[valid])
 
             with torch.no_grad():
                 box_preds_i = self._decode_box2d(points_all, box2d_reg[i].detach())
@@ -394,10 +420,10 @@ class DenseCubeHead(nn.Module):
             all_gt_inds.append(gt_inds_i)
 
         gt_labels = torch.stack(all_labels)      # (N, P)
-        gt_gt_inds = torch.stack(all_gt_inds)    # (N, P)
+        gt_gt_inds = torch.stack(all_gt_inds)    # (N, P)  -- 注意：這是相對於「各圖 valid 子集」的 local index
 
-        valid_mask = gt_labels >= 0              # 排除 ignore 區域 (-1)
-        fg_mask = (gt_labels < self.num_classes) & valid_mask  # 僅保留正樣本點
+        valid_mask = gt_labels >= 0
+        fg_mask = (gt_labels < self.num_classes) & valid_mask
 
         num_fg = max(fg_mask.sum().item(), 1)
 
@@ -405,7 +431,7 @@ class DenseCubeHead(nn.Module):
         storage.put_scalar("dense_cube/num_fg", num_fg / N)
 
         # -----------------------------------------------------------
-        # 1. 類別 Focal Loss
+        # 1. YOLOv8 分類 Focal Loss
         # -----------------------------------------------------------
         cls_target = torch.zeros_like(cls_logits)
         pos_labels = gt_labels[fg_mask]
@@ -428,50 +454,44 @@ class DenseCubeHead(nn.Module):
         # 提取正樣本對應的預測與 GT 張量
         # -----------------------------------------------------------
         img_idx, pt_idx = fg_mask.nonzero(as_tuple=True)
-        gt_idx = gt_gt_inds[img_idx, pt_idx]
+        gt_idx = gt_gt_inds[img_idx, pt_idx]       # 相對於「該圖 valid 子集」的 local index
         box_classes = gt_labels[img_idx, pt_idx]
 
         pts_fg = points_all[pt_idx]
         box2d_reg_fg = box2d_reg[img_idx, pt_idx]
-        centerness_fg = centerness[img_idx, pt_idx, 0]
         cube_deltas_fg = cube_deltas[img_idx, pt_idx]
         cube_dims_fg = cube_dims_raw[img_idx, pt_idx]
         cube_pose_fg = cube_pose_raw[img_idx, pt_idx]
         cube_z_fg = cube_z_raw[img_idx, pt_idx]
         cube_uncert_fg = cube_uncert_raw[img_idx, pt_idx, 0] if self.use_conf else None
 
-        gt_boxes3D_fg = torch.cat([gt_instances[b].gt_boxes3D[g].unsqueeze(0)
-                                    for b, g in zip(img_idx.tolist(), gt_idx.tolist())], dim=0)
-        gt_poses_fg = torch.cat([gt_instances[b].gt_poses[g].unsqueeze(0)
-                                  for b, g in zip(img_idx.tolist(), gt_idx.tolist())], dim=0)
-        gt_box2d_fg = torch.cat([gt_instances[b].gt_boxes.tensor[g].unsqueeze(0)
-                                  for b, g in zip(img_idx.tolist(), gt_idx.tolist())], dim=0)
+        # gt_counts 現在是「valid GT 數量」，而不是原本未過濾的總數 —— 這是修正的核心
+        gt_counts = torch.tensor(
+            [v.shape[0] for v in gt_boxes3D_valid_list], device=device, dtype=torch.long
+        )
+        gt_offsets = torch.cat([
+            torch.zeros(1, device=device, dtype=torch.long), gt_counts.cumsum(0)[:-1]
+        ])
+        global_gt_idx = gt_offsets[img_idx] + gt_idx
+
+        # concat 清單也改用 valid-filtered 版本，順序與上面 gt_counts 完全一致
+        gt_boxes3D_cat = torch.cat(gt_boxes3D_valid_list, dim=0)
+        gt_poses_cat = torch.cat(gt_poses_valid_list, dim=0)
+        gt_box2d_cat = torch.cat(gt_box2d_valid_list, dim=0)
+
+        gt_boxes3D_fg = gt_boxes3D_cat[global_gt_idx]
+        gt_poses_fg = gt_poses_cat[global_gt_idx]
+        gt_box2d_fg = gt_box2d_cat[global_gt_idx]
 
         Ks_fg = torch.stack([Ks[b] / im_scales_ratio[b] for b in img_idx.tolist()]).to(device)
         Ks_fg[:, -1, -1] = 1
 
         # -----------------------------------------------------------
-        # 2. 2D 邊界框 (GIoU) 與 Centerness 損失
+        # 2. 2D 邊界框 (GIoU) 損失 (YOLOv8 風格無 Centerness)
         # -----------------------------------------------------------
         pred_box2d = self._decode_box2d(pts_fg, box2d_reg_fg)
         loss_box2d = giou_loss(pred_box2d, gt_box2d_fg, reduction="sum") / num_fg
-
-        l_t = pts_fg[:, 0] - gt_box2d_fg[:, 0]
-        t_t = pts_fg[:, 1] - gt_box2d_fg[:, 1]
-        r_t = gt_box2d_fg[:, 2] - pts_fg[:, 0]
-        b_t = gt_box2d_fg[:, 3] - pts_fg[:, 1]
-        lr = torch.stack([l_t, r_t], dim=1).clamp(min=0)
-        tb = torch.stack([t_t, b_t], dim=1).clamp(min=0)
-        centerness_target = torch.sqrt(
-            (lr.min(1)[0] / lr.max(1)[0].clamp(min=1e-6))
-            * (tb.min(1)[0] / tb.max(1)[0].clamp(min=1e-6))
-        ).clamp(0, 1)
-        loss_centerness = F.binary_cross_entropy_with_logits(
-            centerness_fg, centerness_target.detach(), reduction="sum"
-        ) / num_fg
-
         losses["DenseCube/loss_box2d"] = loss_box2d * self.loss_w_box2d
-        losses["DenseCube/loss_centerness"] = loss_centerness * self.loss_w_center
 
         # -----------------------------------------------------------
         # 3. 3D 預測解碼 (以 Detached 2D 框作為參考基準)
@@ -520,9 +540,9 @@ class DenseCubeHead(nn.Module):
                 prior_dims_max = prior_dims_mean + 3 * prior_dims_std
                 cube_dims = util.scaled_sigmoid(cube_dims_norm, min=prior_dims_min, max=prior_dims_max)
             else:  # 'exp'
-                cube_dims = torch.exp(cube_dims_norm.clamp(max=5)) * prior_dims_mean
+                cube_dims = torch.exp(cube_dims_norm.clamp(min=-5, max=5)) * prior_dims_mean
         else:
-            cube_dims = torch.exp(cube_dims_norm.clamp(max=5))
+            cube_dims = torch.exp(cube_dims_norm.clamp(min=-5, max=5))
 
         # 解碼 3D 旋轉姿態 (Rotation Pose)
         if self.pose_type == '6d':
@@ -558,7 +578,7 @@ class DenseCubeHead(nn.Module):
             cube_z = cube_z_norm * 100
         elif self.z_type == 'log':
             cube_z_norm = cube_z_sel
-            cube_z = torch.exp(cube_z_sel)
+            cube_z = torch.exp(cube_z_sel.clamp(min=-5, max=8))
         elif self.z_type == 'clusters':
             fg_arange = torch.arange(num_fg, device=device)
             z_means = self.priors_z_stats[box_classes, assignments[fg_arange, box_classes], 0].detach()
@@ -721,7 +741,7 @@ class DenseCubeHead(nn.Module):
         return losses
 
     # ===================================================================
-    # 推論 (Inference)
+    # Inference
     # ===================================================================
     @torch.no_grad()
     def inference(
@@ -747,7 +767,6 @@ class DenseCubeHead(nn.Module):
             for lvl in range(num_levels):
                 cls_l = outputs["cls_logits"][lvl][img_idx].permute(1, 2, 0).reshape(-1, self.num_classes)
                 box_l = outputs["box2d_reg"][lvl][img_idx].permute(1, 2, 0).reshape(-1, 4)
-                ctr_l = outputs["centerness"][lvl][img_idx].permute(1, 2, 0).reshape(-1)
                 delta_l = outputs["cube_deltas"][lvl][img_idx].permute(1, 2, 0).reshape(-1, 2)
                 dims_l = outputs["cube_dims"][lvl][img_idx].permute(1, 2, 0).reshape(-1, 3)
                 pose_l = outputs["cube_pose"][lvl][img_idx].permute(1, 2, 0)
@@ -756,19 +775,20 @@ class DenseCubeHead(nn.Module):
                 if self.use_conf:
                     uncert_l = outputs["cube_uncert"][lvl][img_idx].permute(1, 2, 0).reshape(-1)
 
-                # 綜合分數: sqrt(分類機率 * centerness)
-                scores_l = (cls_l.sigmoid() * ctr_l.sigmoid().unsqueeze(1)).sqrt()
+                scores_l = cls_l.sigmoid()
                 topk = min(self.test_topk_candidates, scores_l.numel())
                 flat_scores, flat_idx = scores_l.reshape(-1).topk(topk)
                 keep_mask = flat_scores > self.test_score_thresh
                 flat_scores = flat_scores[keep_mask]
                 flat_idx = flat_idx[keep_mask]
 
-                pt_idx = flat_idx // self.num_classes
+                pt_idx = torch.div(flat_idx, self.num_classes, rounding_mode='floor')
                 cls_idx = flat_idx % self.num_classes
 
                 pts_l = locations[lvl][pt_idx]
                 box_l_sel = box_l[pt_idx]
+                # 保持與訓練一致：這裡的解碼框「不裁剪」，裁剪只在最終輸出 2D 框時才做，
+                # 3D 中心的 XY 解碼一律使用未裁剪的參考框，避免邊界物體訓練/推理不一致。
                 boxes_dec = self._decode_box2d(pts_l, box_l_sel)
 
                 boxes_all.append(boxes_dec)
@@ -781,8 +801,9 @@ class DenseCubeHead(nn.Module):
                 if self.use_conf:
                     uncert_all.append(uncert_l[pt_idx])
 
+            h, w = image_sizes[img_idx]
+
             if len(boxes_all) == 0 or torch.cat(boxes_all).shape[0] == 0:
-                h, w = image_sizes[img_idx]
                 empty = Instances((h, w))
                 empty.pred_boxes = Boxes(torch.zeros((0, 4), device=device))
                 empty.scores = torch.zeros(0, device=device)
@@ -792,30 +813,30 @@ class DenseCubeHead(nn.Module):
                 empty.pred_dimensions = torch.zeros((0, 3), device=device)
                 empty.pred_pose = torch.zeros((0, 3, 3), device=device)
                 empty.pred_bbox3D = torch.zeros((0, 8, 3), device=device)
+                if self.use_conf:
+                    empty.pred_uncertainty = torch.zeros(0, device=device)
                 results.append(empty)
                 continue
 
-            boxes_all = torch.cat(boxes_all)
+            boxes_all = torch.cat(boxes_all)          # 未裁剪，用於 NMS 與 3D 解碼參考框
             scores_all = torch.cat(scores_all)
             classes_all = torch.cat(classes_all)
 
-            # 限制 2D 預測框在影像範圍內
-            h, w = image_sizes[img_idx]
-            boxes_all[:, 0::2] = boxes_all[:, 0::2].clamp(0, w)
-            boxes_all[:, 1::2] = boxes_all[:, 1::2].clamp(0, h)
-
-            # 依類別執行 Batched NMS
+            # NMS 與訓練時 assigner 使用的參考框保持一致（同樣未裁剪）
             keep = batched_nms(boxes_all, scores_all, classes_all, self.test_nms_thresh)
             keep = keep[: self.test_max_detections]
 
+            boxes_k = boxes_all[keep]                  # 未裁剪，供 3D 解碼使用
             deltas_k = torch.cat(deltas_all)[keep]
             dims_k = torch.cat(dims_all)[keep]
             pose_k = torch.cat(pose_all)[keep]
             z_k = torch.cat(z_all)[keep]
-            boxes_k = boxes_all[keep]
+            scores_k = scores_all[keep]
+            classes_k = classes_all[keep]
+            if self.use_conf:
+                uncert_k = torch.cat(uncert_all)[keep]
 
             n_k = boxes_k.shape[0]
-            classes_k = classes_all[keep]
 
             K = (Ks[img_idx] / im_scales_ratio[img_idx]).to(device)
             K[-1, -1] = 1
@@ -854,9 +875,9 @@ class DenseCubeHead(nn.Module):
                     prior_dims_max = prior_dims_mean + 3 * prior_dims_std
                     cube_dims = util.scaled_sigmoid(dims_k, min=prior_dims_min, max=prior_dims_max)
                 else:
-                    cube_dims = torch.exp(dims_k.clamp(max=5)) * prior_dims_mean
+                    cube_dims = torch.exp(dims_k.clamp(min=-5, max=5)) * prior_dims_mean
             else:
-                cube_dims = torch.exp(dims_k.clamp(max=5))
+                cube_dims = torch.exp(dims_k.clamp(min=-5, max=5))
 
             # 3D 姿態推論解碼
             if self.pose_type == '6d':
@@ -885,7 +906,7 @@ class DenseCubeHead(nn.Module):
             elif self.z_type == 'sigmoid':
                 cube_z = torch.sigmoid(cube_z_sel) * 100
             elif self.z_type == 'log':
-                cube_z = torch.exp(cube_z_sel)
+                cube_z = torch.exp(cube_z_sel.clamp(min=-5, max=8))
             elif self.z_type == 'clusters':
                 k_arange = torch.arange(n_k, device=device)
                 z_means = self.priors_z_stats[classes_k, assignments[k_arange, classes_k], 0]
@@ -900,10 +921,22 @@ class DenseCubeHead(nn.Module):
             cube_x3d = cube_z * (cube_x - K[0, 2]) / K[0, 0]
             cube_y3d = cube_z * (cube_y - K[1, 2]) / K[1, 1]
 
+            # ---- 不確定性正式參與最終置信度打分（不再是死代碼）----
+            if self.use_conf:
+                cube_conf = torch.exp(-uncert_k)
+                final_scores = (scores_k * cube_conf).clamp(min=0).sqrt()
+            else:
+                final_scores = scores_k
+
+            # 最終輸出的 2D 框才裁剪到影像邊界內，3D 解碼全程使用未裁剪框
+            pred_boxes_out = boxes_k.clone()
+            pred_boxes_out[:, 0::2] = pred_boxes_out[:, 0::2].clamp(0, w)
+            pred_boxes_out[:, 1::2] = pred_boxes_out[:, 1::2].clamp(0, h)
+
             result = Instances((h, w))
-            result.pred_boxes = Boxes(boxes_all[keep])
-            result.scores = scores_all[keep]
-            result.pred_classes = classes_all[keep]
+            result.pred_boxes = Boxes(pred_boxes_out)
+            result.scores = final_scores
+            result.pred_classes = classes_k
             result.pred_center_cam = torch.stack([cube_x3d, cube_y3d, cube_z], dim=1)
             result.pred_center_2D = torch.stack([cube_x, cube_y], dim=1) * im_scales_ratio[img_idx]
             result.pred_dimensions = cube_dims
@@ -911,10 +944,8 @@ class DenseCubeHead(nn.Module):
             result.pred_bbox3D = util.get_cuboid_verts_faces(
                 torch.cat([result.pred_center_cam, cube_dims], dim=1), cube_pose
             )[0]
-
             if self.use_conf:
-                cube_conf = torch.exp(-torch.cat(uncert_all)[keep])
-                result.scores = (result.scores * cube_conf).sqrt()
+                result.pred_uncertainty = cube_conf  # exp(-uncert)，越大越可信，供下游過濾/除錯用
 
             results.append(result)
 

@@ -52,15 +52,15 @@ MODEL:
     TYPE: 'dla34'
 
   FPN:
-    IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
-    # IN_FEATURES: ['p2', 'p3', 'p4']
+    # IN_FEATURES: ['p2', 'p3', 'p4', 'p5', 'p6']
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
 
   # -------------------------------------------------------------------
   # Single-Stage Dense Cube Head & Assigner Configuration
   # -------------------------------------------------------------------
   DENSE_HEAD:
     NAME: "DenseCubeHead"
-    IN_FEATURES: ['p2', 'p3', 'p4']
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
     NUM_CLASSES: 7           # 與 CATEGORY_NAMES 類別數量保持一致
     NUM_CONVS: 4             # 卷積塔層數
     CONV_DIM: 256            # 卷積通道數
@@ -73,7 +73,7 @@ MODEL:
 
     # --- SimOTA Assigner 設定 (assigner.py) ---
     ASSIGNER: "SimOTAAssigner"
-    CENTER_RADIUS: 2.5       # 中心先驗採樣半徑
+    CENTER_RADIUS: 1.5       # 中心先驗採樣半徑
     CANDIDATE_TOPK: 10       # 動態 K 動態匹配候選數
     CLS_COST_WEIGHT: 1.0     # 匹配代價矩陣分類權重
     IOU_COST_WEIGHT: 3.0     # 匹配代價矩陣 2D IoU 權重
@@ -82,17 +82,16 @@ MODEL:
     LOSS_W_3D: 1.0           # 3D 總體損失縮放倍率
     LOSS_W_CLS: 1.0          # 分類 Focal loss 權重
     LOSS_W_BOX2D: 1.0        # 2D 框 GIoU loss 權重
-    LOSS_W_CENTERNESS: 1.0   # Centerness BCE loss 權重
     LOSS_W_XY: 1.0           # 3D 投影中心 XY loss 權重
     LOSS_W_Z: 1.0            # 3D 深度 Z loss 權重
     LOSS_W_DIMS: 1.0         # 3D 尺寸 Dimensions loss 權重
     LOSS_W_POSE: 1.0         # 3D 旋轉姿態 Pose loss 權重
-    LOSS_W_JOINT: 1.0        # 3D 組合邊界框 Joint loss 權重
+    LOSS_W_JOINT: 0.1        # 3D 組合邊界框 Joint loss 權重
 
     # --- 3D 幾何與先驗設定 (與原版 Cube R-CNN 對齊) ---
     Z_TYPE: "direct"            # 深度迴歸空間 ('log', 'direct', 'sigmoid', 'clusters')
     DIMS_PRIORS_ENABLED: True  # 是否使用各類別 3D 尺寸先驗
-    DIMS_PRIORS_FUNC: "exp"  # 尺寸先驗解碼函式 ('exp', 'sigmoid')
+    DIMS_PRIORS_FUNC: None  # 尺寸先驗解碼函式 ('exp', 'sigmoid')
     CHAMFER_POSE: True       # 旋轉與 Joint 損失是否採用 Chamfer 距離
     DISENTANGLED_LOSS: True  # 啟用 3D 變數解耦損失
     INVERSE_Z_WEIGHT: True   # 啟用反深度加權 (提升近處物件權重)
@@ -101,7 +100,7 @@ MODEL:
     VIRTUAL_FOCAL: 512.0     # 虛擬相機參考焦距
 
     # --- 推論與 NMS 設定 ---
-    SCORE_THRESH_TEST: 0.01
+    SCORE_THRESH_TEST: 0.05
     TOPK_CANDIDATES_TEST: 1000
-    NMS_THRESH_TEST: 0.6
+    NMS_THRESH_TEST: 0.5
     MAX_DETECTIONS_PER_IMAGE: 100

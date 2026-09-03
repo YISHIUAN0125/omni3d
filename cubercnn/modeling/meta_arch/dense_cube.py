@@ -263,7 +263,7 @@ from detectron2.data import MetadataCatalog
 from detectron2.utils.visualizer import Visualizer
 from detectron2.layers import batched_nms
 
-from cubercnn.modeling.dense_head import build_dense_cube_head
+from cubercnn.modeling.dense_head import build_dense_cube_head, build_cascade_dense_cube_head
 from cubercnn import util, vis
 
 
@@ -299,7 +299,7 @@ class DenseCube3D(torch.nn.Module):
     @classmethod
     def from_config(cls, cfg, priors: Optional[dict] = None):
         backbone = build_backbone(cfg)
-        head = build_dense_cube_head(cfg, backbone.output_shape(), priors=priors)
+        head = build_cascade_dense_cube_head(cfg, backbone.output_shape(), priors=priors)
         return {
             "backbone": backbone,
             "head": head,
