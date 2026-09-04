@@ -85,6 +85,8 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_JOINT = 1.0
 
+    cfg.MODEL.ROI_CUBE_HEAD.MAX_PROPOSALS = 256
+
     # -------------------------------------------------------------------------
     # Single-Stage Dense Cube Head Options (DenseCubeHead + SimOTAAssigner)
     # -------------------------------------------------------------------------
@@ -133,6 +135,8 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.DENSE_HEAD.ALLOCENTRIC_POSE = True        # Predict allocentric rotation
     cfg.MODEL.DENSE_HEAD.VIRTUAL_DEPTH = True           # Use virtual camera focal length
     cfg.MODEL.DENSE_HEAD.VIRTUAL_FOCAL = 512.0
+
+    cfg.MODEL.DENSE_HEAD.GT_IN_PROPOSALS = True
 
     # Dense Head Inference & NMS settings
     cfg.MODEL.DENSE_HEAD.SCORE_THRESH_TEST = 0.05

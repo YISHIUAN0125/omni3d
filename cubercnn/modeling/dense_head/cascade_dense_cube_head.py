@@ -100,6 +100,7 @@ class CascadeDenseCubeHead(nn.Module):
         virtual_focal: float,
         use_conf: bool,
         cluster_bins: int,
+        max_proposals: int,
         gt_in_proposals: bool,
         priors: Optional[dict] = None,
     ):
@@ -134,6 +135,7 @@ class CascadeDenseCubeHead(nn.Module):
         self.use_conf = use_conf
         self.cluster_bins = max(cluster_bins, 1)
         self.gt_in_proposals = gt_in_proposals
+        self.max_proposals = max_proposals
 
         self.test_score_thresh = test_score_thresh
         self.test_topk_candidates = test_topk_candidates
@@ -164,15 +166,25 @@ class CascadeDenseCubeHead(nn.Module):
         # -------------------------------------------------------------
         # 2D branch
         # -------------------------------------------------------------
-        self.cls_towers = nn.ModuleList()
-        self.box2d_towers = nn.ModuleList()
+        # self.cls_towers = nn.ModuleList()
+        # self.box2d_towers = nn.ModuleList()
+        # self.cls_preds = nn.ModuleList()
+        # self.box2d_preds = nn.ModuleList()
+
+        # for _ in range(self.num_levels):
+        #     self.cls_towers.append(self._make_tower(conv_dim, num_convs))
+        #     self.cls_preds.append(nn.Conv2d(conv_dim, num_classes, 1))
+        #     self.box2d_towers.append(self._make_tower(conv_dim, num_convs))
+        #     self.box2d_preds.append(nn.Conv2d(conv_dim, 4, 1))
+
+        # Shared Conv tower
+        self.cls_tower = self._make_tower(conv_dim, num_convs)
+        self.box2d_tower = self._make_tower(conv_dim, num_convs)
+        
         self.cls_preds = nn.ModuleList()
         self.box2d_preds = nn.ModuleList()
-
         for _ in range(self.num_levels):
-            self.cls_towers.append(self._make_tower(conv_dim, num_convs))
             self.cls_preds.append(nn.Conv2d(conv_dim, num_classes, 1))
-            self.box2d_towers.append(self._make_tower(conv_dim, num_convs))
             self.box2d_preds.append(nn.Conv2d(conv_dim, 4, 1))
 
         self._init_weights(prior_prob)
@@ -234,6 +246,7 @@ class CascadeDenseCubeHead(nn.Module):
             "test_topk_candidates": cfg.MODEL.DENSE_HEAD.TOPK_CANDIDATES_TEST,
             "test_nms_thresh": cfg.MODEL.DENSE_HEAD.NMS_THRESH_TEST,
             "test_max_detections": cfg.MODEL.DENSE_HEAD.MAX_DETECTIONS_PER_IMAGE,
+            "gt_in_proposals": cfg.MODEL.DENSE_HEAD.GT_IN_PROPOSALS,
             "loss_w_3d": cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D,
             "loss_w_xy": cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_XY,
             "loss_w_z": cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_Z,
@@ -251,7 +264,7 @@ class CascadeDenseCubeHead(nn.Module):
             "virtual_focal": cfg.MODEL.ROI_CUBE_HEAD.VIRTUAL_FOCAL,
             "use_conf": cfg.MODEL.ROI_CUBE_HEAD.USE_CONFIDENCE,
             "cluster_bins": cfg.MODEL.ROI_CUBE_HEAD.CLUSTER_BINS,
-            "gt_in_proposals": getattr(cfg.MODEL.DENSE_HEAD, "GT_IN_PROPOSALS", True),
+            "max_proposals": cfg.MODEL.ROI_CUBE_HEAD.MAX_PROPOSALS,
             "priors": priors,
         }
 
@@ -259,12 +272,23 @@ class CascadeDenseCubeHead(nn.Module):
     # Forward pass
     # -------------------------------------------------------------
     def forward(self, features: Dict[str, torch.Tensor]) -> Dict[str, List[torch.Tensor]]:
+        # cls_logits, box2d_reg = [], []
+        # for level, f in enumerate(self.in_features):
+        #     x = features[f]
+        #     stride = self.fpn_strides[level]
+        #     cls_feat = self.cls_towers[level](x)
+        #     box_feat = self.box2d_towers[level](x)
+        #     cls_logits.append(self.cls_preds[level](cls_feat))
+        #     box2d_reg.append(F.relu(self.box2d_preds[level](box_feat)) * stride)
+        # return {"cls_logits": cls_logits, "box2d_reg": box2d_reg}
+
+        # Shared conv tower
         cls_logits, box2d_reg = [], []
         for level, f in enumerate(self.in_features):
             x = features[f]
             stride = self.fpn_strides[level]
-            cls_feat = self.cls_towers[level](x)
-            box_feat = self.box2d_towers[level](x)
+            cls_feat = self.cls_tower(x)
+            box_feat = self.box2d_tower(x)
             cls_logits.append(self.cls_preds[level](cls_feat))
             box2d_reg.append(F.relu(self.box2d_preds[level](box_feat)) * stride)
         return {"cls_logits": cls_logits, "box2d_reg": box2d_reg}
@@ -766,36 +790,57 @@ class CascadeDenseCubeHead(nn.Module):
             return losses
 
         # ---- 3. 交由 _forward_cube 計算 3D Losses ----
-        with torch.no_grad():
-            proposal_boxes_fg_all = self._decode_box2d(pts_fg, box2d_reg_fg.detach())
+        # with torch.no_grad():
+        #     proposal_boxes_fg_all = self._decode_box2d(pts_fg, box2d_reg_fg.detach())
 
-        proposal_boxes_per_image, box_classes_per_image = [], []
-        gt_boxes3D_per_image, gt_poses_per_image = [], []
+        # proposal_boxes_per_image, box_classes_per_image = [], []
+        # gt_boxes3D_per_image, gt_poses_per_image = [], []
 
-        for b in range(N):
-            m = (img_idx == b)
-            proposal_boxes_per_image.append(proposal_boxes_fg_all[m])
-            box_classes_per_image.append(box_classes[m])
-            gt_boxes3D_per_image.append(gt_boxes3D_fg[m])
-            gt_poses_per_image.append(gt_poses_fg[m])
+        # for b in range(N):
+        #     m = (img_idx == b)
+        #     proposal_boxes_per_image.append(proposal_boxes_fg_all[m])
+        #     box_classes_per_image.append(box_classes[m])
+        #     gt_boxes3D_per_image.append(gt_boxes3D_fg[m])
+        #     gt_poses_per_image.append(gt_poses_fg[m])
 
-        # 訓練穩定化：混入GT框
-        if self.gt_in_proposals:
-            proposal_boxes_per_image, box_classes_per_image, gt_boxes3D_per_image, gt_poses_per_image = \
-                self._augment_proposals_with_gt(
-                    proposal_boxes_per_image, box_classes_per_image,
-                    gt_boxes3D_per_image, gt_poses_per_image, gt_instances,
-                )
+        # # 訓練穩定化：混入GT框
+        # if self.gt_in_proposals:
+        #     proposal_boxes_per_image, box_classes_per_image, gt_boxes3D_per_image, gt_poses_per_image = \
+        #         self._augment_proposals_with_gt(
+        #             proposal_boxes_per_image, box_classes_per_image,
+        #             gt_boxes3D_per_image, gt_poses_per_image, gt_instances,
+        #         )
 
-        # 包裝成 Instances 列表以配合 _forward_cube 的標準介面
-        proposals = []
-        for b in range(N):
-            inst = Instances(gt_instances[b].image_size)
-            inst.proposal_boxes = Boxes(proposal_boxes_per_image[b])
-            inst.gt_classes = box_classes_per_image[b]
-            inst.gt_boxes3D = gt_boxes3D_per_image[b]
-            inst.gt_poses = gt_poses_per_image[b]
-            proposals.append(inst)
+        # # 包裝成 Instances 列表以配合 _forward_cube 的標準介面
+        # proposals = []
+        # for b in range(N):
+        #     inst = Instances(gt_instances[b].image_size)
+        #     inst.proposal_boxes = Boxes(proposal_boxes_per_image[b])
+        #     inst.gt_classes = box_classes_per_image[b]
+        #     inst.gt_boxes3D = gt_boxes3D_per_image[b]
+        #     inst.gt_poses = gt_poses_per_image[b]
+        #     proposals.append(inst)
+
+        # _, cube_losses = self._forward_cube(
+        #     features=features, instances=proposals, Ks=Ks, 
+        #     im_scales_ratio=im_scales_ratio, im_current_dims=im_current_dims,
+        #     is_training=True
+        # )
+        # losses.update(cube_losses)
+
+        proposals = self._sample_and_augment_proposals(
+            num_fg=num_fg,
+            img_idx=img_idx,
+            box_classes=box_classes,
+            pts_fg=pts_fg,
+            box2d_reg_fg=box2d_reg_fg,
+            gt_boxes3D_fg=gt_boxes3D_fg,
+            gt_poses_fg=gt_poses_fg,
+            gt_instances=gt_instances,
+            N=N,
+            device=device,
+            max_proposals=self.max_proposals
+        )
 
         _, cube_losses = self._forward_cube(
             features=features, instances=proposals, Ks=Ks, 
@@ -901,6 +946,66 @@ class CascadeDenseCubeHead(nn.Module):
             res.pred_boxes = Boxes(clipped)
 
         return results
+
+    def _sample_and_augment_proposals(
+        self,
+        num_fg: int,
+        img_idx: torch.Tensor,
+        box_classes: torch.Tensor,
+        pts_fg: torch.Tensor,
+        box2d_reg_fg: torch.Tensor,
+        gt_boxes3D_fg: torch.Tensor,
+        gt_poses_fg: torch.Tensor,
+        gt_instances: List[Instances],
+        N: int,
+        device: torch.device,
+        max_proposals: int = 256
+    ) -> List[Instances]:
+        
+        # 1. 隨機抽樣限制數量 (Subsample)
+        if num_fg > max_proposals:
+            perm = torch.randperm(num_fg, device=device)[:max_proposals]
+            img_idx = img_idx[perm]
+            box_classes = box_classes[perm]
+            pts_fg = pts_fg[perm]
+            box2d_reg_fg = box2d_reg_fg[perm]
+            gt_boxes3D_fg = gt_boxes3D_fg[perm]
+            gt_poses_fg = gt_poses_fg[perm]
+
+        # 2. 幾何解碼
+        with torch.no_grad():
+            proposal_boxes_fg_all = self._decode_box2d(pts_fg, box2d_reg_fg.detach())
+
+        # 3. 依據 Batch Index (img_idx) 分配回各張圖片
+        proposal_boxes_per_image, box_classes_per_image = [], []
+        gt_boxes3D_per_image, gt_poses_per_image = [], []
+
+        for b in range(N):
+            m = (img_idx == b)
+            proposal_boxes_per_image.append(proposal_boxes_fg_all[m])
+            box_classes_per_image.append(box_classes[m])
+            gt_boxes3D_per_image.append(gt_boxes3D_fg[m])
+            gt_poses_per_image.append(gt_poses_fg[m])
+
+        # 4. 混入 Ground Truth
+        if self.gt_in_proposals:
+            proposal_boxes_per_image, box_classes_per_image, gt_boxes3D_per_image, gt_poses_per_image = \
+                self._augment_proposals_with_gt(
+                    proposal_boxes_per_image, box_classes_per_image,
+                    gt_boxes3D_per_image, gt_poses_per_image, gt_instances,
+                )
+
+        # 5. 封裝為 Instances
+        proposals = []
+        for b in range(N):
+            inst = Instances(gt_instances[b].image_size)
+            inst.proposal_boxes = Boxes(proposal_boxes_per_image[b])
+            inst.gt_classes = box_classes_per_image[b]
+            inst.gt_boxes3D = gt_boxes3D_per_image[b]
+            inst.gt_poses = gt_poses_per_image[b]
+            proposals.append(inst)
+
+        return proposals
 
     def _empty_instances(self, image_size, device):
         empty = Instances(image_size)
