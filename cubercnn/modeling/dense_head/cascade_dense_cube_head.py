@@ -703,16 +703,6 @@ class CascadeDenseCubeHead(nn.Module):
             #     gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
             # )
 
-            # ==========================================
-            # [新增 DEBUG 區塊] 檢查標籤分配狀況
-            # ==========================================
-            # fg_mask_i = (labels_i >= 0) & (labels_i < self.num_classes)
-            # if fg_mask_i.sum() > 0:
-            #     print(f"\n[Iter Debug] Image {i} ---")
-            #     print("1. 真實物件類別 (GT):", gt_labels_i.tolist())
-            #     print("2. Assigner 分配的前景類別:", labels_i[fg_mask_i].tolist())
-            #     print("3. Target Score 最大值:", target_score_i[fg_mask_i].max(dim=-1)[0].mean().item())
-            # ==========================================
             all_labels.append(labels_i)
             all_gt_inds.append(gt_inds_i)
             # all_target_scores.append(target_score_i)
