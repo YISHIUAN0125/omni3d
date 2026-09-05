@@ -360,8 +360,10 @@ def main(args):
     priors = None
 
     if args.eval_only:
-        category_path = os.path.join(util.file_parts(args.config_file)[0], 'category_meta.json')
-        # category_path = "output/omni3d_p3p6_run2/category_meta.json"
+        # category_path = os.path.join(util.file_parts(args.config_file)[0], 'category_meta.json')
+        
+        weight_dir = os.path.dirname(cfg.MODEL.WEIGHTS)
+        category_path = os.path.join(weight_dir, 'category_meta.json')
         
         # store locally if needed
         if category_path.startswith(util.CubeRCNNHandler.PREFIX):
