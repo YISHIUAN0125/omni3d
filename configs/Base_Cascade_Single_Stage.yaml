@@ -71,7 +71,10 @@ MODEL:
     PRIOR_PROB: 0.01
     FOCAL_ALPHA: 0.25
     FOCAL_GAMMA: 2.0
-    ASSIGNER: "SimOTAAssigner"
+    ASSIGNER: "TaskAlignedAssigner"
+    TAL_TOPK: 13
+    TAL_ALPHA: 1.0
+    TAL_BETA: 6.0
     CENTER_RADIUS: 1.5
     CANDIDATE_TOPK: 10
     LOSS_W_CLS: 1.0

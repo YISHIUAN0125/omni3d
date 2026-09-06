@@ -23,9 +23,10 @@ from pytorch3d.transforms import (
 )
 from pytorch3d.transforms.so3 import so3_relative_angle
 
-from cubercnn.modeling.dense_head.assigner import build_assigner, SimOTAAssigner, build_tal_assigner, TaskAlignedAssigner
+from cubercnn.modeling.dense_head.assigner import build_assigner, build_tal_assigner
 from cubercnn.modeling.roi_heads.cube_head import build_cube_head
 from cubercnn import util
+from cubercnn.modeling.losses import bbox_loss, quality_focal_loss
 
 logger = logging.getLogger(__name__)
 
@@ -34,20 +35,6 @@ SQRT_2_CONSTANT = 1.41421356
 
 CASCADE_DENSE_CUBE_HEAD_REGISTRY = Registry("CASCADE_DENSE_CUBE_HEAD")
 
-
-def quality_focal_loss(pred_logits: torch.Tensor, target_scores: torch.Tensor, beta: float = 2.0, reduction: str = "sum"):
-    pred_sigmoid = pred_logits.sigmoid()
-    
-    # |y - sigma|^beta
-    scale_factor = (pred_sigmoid - target_scores).abs().pow(beta)
-    bce_loss = F.binary_cross_entropy_with_logits(pred_logits, target_scores, reduction="none")
-    loss = scale_factor * bce_loss
-    
-    if reduction == "sum":
-        return loss.sum()
-    elif reduction == "mean":
-        return loss.mean()
-    return loss
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1):
@@ -74,7 +61,7 @@ class CascadeDenseCubeHead(nn.Module):
         prior_prob: float,
         focal_alpha: float,
         focal_gamma: float,
-        assigner: TaskAlignedAssigner,  
+        assigner,  
         cube_head: nn.Module,
         cube_pooler: nn.Module,
         loss_w_3d: float,
@@ -236,8 +223,8 @@ class CascadeDenseCubeHead(nn.Module):
             "prior_prob": cfg.MODEL.DENSE_HEAD.PRIOR_PROB,
             "focal_alpha": cfg.MODEL.DENSE_HEAD.FOCAL_ALPHA,
             "focal_gamma": cfg.MODEL.DENSE_HEAD.FOCAL_GAMMA,
-            "assigner": build_assigner(cfg),
-            # "assigner": build_tal_assigner(cfg),
+            # "assigner": build_assigner(cfg),
+            "assigner": build_tal_assigner(cfg),
             "cube_head": cube_head,
             "cube_pooler": cube_pooler,
             "loss_w_cls": cfg.MODEL.DENSE_HEAD.LOSS_W_CLS,
@@ -550,14 +537,14 @@ class CascadeDenseCubeHead(nn.Module):
                 else:
                     loss_dims = self.l1_loss(cube_dims_norm, torch.log(gt_dims)).mean(1)
 
-                try:
-                    if self.allocentric_pose:
-                        gt_poses_allocentric = util.R_to_allocentric(Ks_fg, gt_poses_fg, u=cube_x.detach(), v=cube_y.detach())
-                        loss_pose = 1 - so3_relative_angle(cube_pose_allocentric, gt_poses_allocentric, eps=0.1, cos_angle=True)
-                    else:
-                        loss_pose = 1 - so3_relative_angle(cube_pose, gt_poses_fg, eps=0.1, cos_angle=True)
-                except Exception:
-                    loss_pose = torch.zeros(n, device=device)
+                if self.allocentric_pose:
+                    gt_poses_allocentric = util.R_to_allocentric(Ks_fg, gt_poses_fg, u=cube_x.detach(), v=cube_y.detach())
+                    raw_pose = 1 - so3_relative_angle(cube_pose_allocentric, gt_poses_allocentric, eps=0.1, cos_angle=True)
+                else:
+                    raw_pose = 1 - so3_relative_angle(cube_pose, gt_poses_fg, eps=0.1, cos_angle=True)
+
+                valid_pose_mask = (~raw_pose.isnan()) & (~raw_pose.isinf())
+                loss_pose = torch.where(valid_pose_mask, raw_pose, torch.zeros_like(raw_pose))
 
                 if self.z_type == 'direct':
                     loss_z = self.l1_loss(cube_z, gt_z)
@@ -718,18 +705,18 @@ class CascadeDenseCubeHead(nn.Module):
             with torch.no_grad():
                 box_preds_i = self._decode_box2d(points_all, box2d_reg[i].detach())
 
-            labels_i, gt_inds_i = self.assigner.assign(
-                cls_logits[i].detach(), box_preds_i, points_all, strides_all,
-                gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
-            )
-            # labels_i, gt_inds_i, target_score_i = self.assigner.assign(
+            # labels_i, gt_inds_i = self.assigner.assign(
             #     cls_logits[i].detach(), box_preds_i, points_all, strides_all,
             #     gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
             # )
+            labels_i, gt_inds_i, target_score_i = self.assigner.assign(
+                cls_logits[i].detach(), box_preds_i, points_all, strides_all,
+                gt_boxes_i, gt_labels_i, gt_boxes_ign_i,
+            )
 
             all_labels.append(labels_i)
             all_gt_inds.append(gt_inds_i)
-            # all_target_scores.append(target_score_i)
+            all_target_scores.append(target_score_i)
 
         gt_labels = torch.stack(all_labels)
         gt_gt_inds = torch.stack(all_gt_inds)
@@ -745,17 +732,17 @@ class CascadeDenseCubeHead(nn.Module):
         cls_target = torch.zeros_like(cls_logits)
         pos_labels = gt_labels[fg_mask]
         cls_target[fg_mask] = F.one_hot(pos_labels, self.num_classes).float()
-        # cls_target = torch.stack(all_target_scores)
+        cls_target = torch.stack(all_target_scores)
 
-        loss_cls = sigmoid_focal_loss_jit(
-            cls_logits[valid_mask], cls_target[valid_mask],
-            alpha=self.focal_alpha, gamma=self.focal_gamma, reduction="sum",
-        ) / num_fg
-
-        # loss_cls = quality_focal_loss(
+        # loss_cls = sigmoid_focal_loss_jit(
         #     cls_logits[valid_mask], cls_target[valid_mask],
-        #     beta=self.focal_gamma, reduction="sum",
+        #     alpha=self.focal_alpha, gamma=self.focal_gamma, reduction="sum",
         # ) / num_fg
+
+        loss_cls = quality_focal_loss(
+            cls_logits[valid_mask], cls_target[valid_mask],
+            beta=self.focal_gamma, reduction="sum",
+        ) / num_fg
 
         losses = {"DenseCube/loss_cls": loss_cls * self.loss_w_cls}
 
@@ -783,7 +770,8 @@ class CascadeDenseCubeHead(nn.Module):
         gt_box2d_fg = gt_box2d_cat[global_gt_idx]
 
         # ---- 2. 2D GIoU loss ----
-        loss_box2d = giou_loss(pred_box2d, gt_box2d_fg, reduction="sum") / num_fg
+        # loss_box2d = giou_loss(pred_box2d, gt_box2d_fg, reduction="sum") / num_fg
+        loss_box2d = bbox_loss(pred_box2d, gt_box2d_fg, reduction="sum") / num_fg
         losses["DenseCube/loss_box2d"] = loss_box2d * self.loss_w_box2d
 
         if self.loss_w_3d <= 0:

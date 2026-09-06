@@ -7,6 +7,8 @@ from detectron2.structures import Boxes, pairwise_iou
 from detectron2.utils.memory import retry_if_cuda_oom
 from detectron2.utils.registry import Registry
 
+from cubercnn.modeling.losses import pairwise_bbox_iou
+
 SIMOTA_ASSIGNER_REGISTRY = Registry("SIMOTA_ASSIGNER")
 TASKALIGNED_ASSIGNER_REGISTRY = Registry("TASKALIGNED_ASSIGNER")
 
@@ -207,7 +209,8 @@ class TaskAlignedAssigner:
         box_preds_c = box_preds_i[cand_idx]
         is_in_gts_c = is_in_gts[cand_idx]
 
-        pair_iou = retry_if_cuda_oom(pairwise_iou)(Boxes(box_preds_c), Boxes(gt_boxes_i)).clamp_(0)
+        # pair_iou = retry_if_cuda_oom(pairwise_iou)(Boxes(box_preds_c), Boxes(gt_boxes_i)).clamp_(0)
+        pair_iou = retry_if_cuda_oom(pairwise_bbox_iou)(box_preds_c, gt_boxes_i, mode="ciou").clamp_(0)
 
         bbox_scores = cls_preds_c[:, gt_labels_i] 
         if obj_preds_i is not None:
