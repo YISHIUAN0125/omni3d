@@ -600,14 +600,14 @@ class DenseCubeHead(nn.Module):
             else:
                 loss_dims = self.l1_loss(cube_dims_norm, torch.log(gt_dims)).mean(1)
 
-            try:
-                if self.allocentric_pose:
-                    gt_poses_allocentric = util.R_to_allocentric(Ks_fg, gt_poses_fg, u=cube_x.detach(), v=cube_y.detach())
-                    loss_pose = 1 - so3_relative_angle(cube_pose_allocentric, gt_poses_allocentric, eps=0.1, cos_angle=True)
-                else:
-                    loss_pose = 1 - so3_relative_angle(cube_pose, gt_poses_fg, eps=0.1, cos_angle=True)
-            except Exception:
-                loss_pose = torch.zeros(num_fg, device=device)
+            if self.allocentric_pose:
+                gt_poses_allocentric = util.R_to_allocentric(Ks_fg, gt_poses_fg, u=cube_x.detach(), v=cube_y.detach())
+                raw_pose = 1 - so3_relative_angle(cube_pose_allocentric, gt_poses_allocentric, eps=0.1, cos_angle=True)
+            else:
+                raw_pose = 1 - so3_relative_angle(cube_pose, gt_poses_fg, eps=0.1, cos_angle=True)
+
+            valid_pose_mask = (~raw_pose.isnan()) & (~raw_pose.isinf())
+            loss_pose = torch.where(valid_pose_mask, raw_pose, torch.zeros_like(raw_pose))
 
             if self.z_type == 'direct':
                 loss_z = self.l1_loss(cube_z, gt_z)
