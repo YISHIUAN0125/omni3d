@@ -85,9 +85,12 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_POSE = 1.0
     cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_JOINT = 1.0
 
+    cfg.MODEL.ROI_CUBE_HEAD.MAX_PROPOSALS = 256
+
     # -------------------------------------------------------------------------
     # Single-Stage Dense Cube Head Options (DenseCubeHead + SimOTAAssigner)
     # -------------------------------------------------------------------------
+    cfg.MODEL.BACKBONE.SIZE = 's'
     cfg.MODEL.DENSE_HEAD = CN()
     cfg.MODEL.DENSE_HEAD.NAME = "DenseCubeHead"
     cfg.MODEL.DENSE_HEAD.IN_FEATURES = ['p2', 'p3', 'p4', 'p5', 'p6']
@@ -107,6 +110,9 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.DENSE_HEAD.CANDIDATE_TOPK = 10            # Top-k candidate IoU sum for dynamic K
     cfg.MODEL.DENSE_HEAD.CLS_COST_WEIGHT = 1.0          # Classification cost weight
     cfg.MODEL.DENSE_HEAD.IOU_COST_WEIGHT = 3.0          # 2D IoU cost weight
+    cfg.MODEL.DENSE_HEAD.TAL_TOPK = 13
+    cfg.MODEL.DENSE_HEAD.TAL_ALPHA = 1.0
+    cfg.MODEL.DENSE_HEAD.TAL_BETA = 6.0
 
     # Dense Head Loss Weights
     cfg.MODEL.DENSE_HEAD.LOSS_W_3D = 1.0                # Overall 3D loss scaling
@@ -129,6 +135,8 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.DENSE_HEAD.ALLOCENTRIC_POSE = True        # Predict allocentric rotation
     cfg.MODEL.DENSE_HEAD.VIRTUAL_DEPTH = True           # Use virtual camera focal length
     cfg.MODEL.DENSE_HEAD.VIRTUAL_FOCAL = 512.0
+
+    cfg.MODEL.DENSE_HEAD.GT_IN_PROPOSALS = True
 
     # Dense Head Inference & NMS settings
     cfg.MODEL.DENSE_HEAD.SCORE_THRESH_TEST = 0.05
