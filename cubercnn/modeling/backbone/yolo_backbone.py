@@ -4,8 +4,10 @@
 import math
 import torch
 import torch.nn as nn
+from ultralytics import YOLO
 from detectron2.layers import ShapeSpec
 from detectron2.modeling import BACKBONE_REGISTRY, Backbone
+from detectron2.layers import ShapeSpec, Conv2d, get_norm
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -214,6 +216,10 @@ class YOLO26(Backbone):
 
         return {"p3": p3, "p4": p4, "p5": p5}
 
+    @property
+    def size_divisibility(self):
+        return 32
+
     def output_shape(self):
         return {
             name: ShapeSpec(channels=self._out_feature_channels[name], stride=self._out_feature_strides[name])
@@ -292,6 +298,151 @@ class YOLO26PAN(Backbone):
         }
 
 @BACKBONE_REGISTRY.register()
-def build_yolo26_pan_backbone(cfg, input_shape):
+def build_yolo26_pan_backbone(cfg, input_shape, priors=None):
     bottom_up = YOLO26(cfg, input_shape)
     return YOLO26PAN(cfg, bottom_up)
+
+
+class _ExtraP2Stage(nn.Module):
+    def __init__(self, c_p2_src, c_p3, mid_channels=None):
+        super().__init__()
+        mid_channels = mid_channels or c_p2_src
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.conv = nn.Sequential(
+            Conv2d(c_p2_src + c_p3, mid_channels, kernel_size=3, padding=1,
+                   norm=get_norm("BN", mid_channels), activation=nn.SiLU()),
+            Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1,
+                   norm=get_norm("BN", mid_channels), activation=nn.SiLU()),
+        )
+        self.out_channels = mid_channels
+
+    def forward(self, p2_src, p3):
+        return self.conv(torch.cat([p2_src, self.upsample(p3)], dim=1))
+
+
+class YOLO11PANBackbone(Backbone):
+    def __init__(
+        self,
+        yolo_weights: str,
+        out_features=("p3", "p4", "p5"),
+        out_channels: int = 256,
+        norm: str = "BN",
+        pixel_mean=(123.675, 116.28, 103.53),
+        pixel_std=(58.395, 57.12, 57.375),
+        freeze_backbone: bool = False,
+    ):
+        super().__init__()
+        assert all(f in ("p2", "p3", "p4", "p5") for f in out_features)
+        self._out_features = list(out_features)
+        need_p2 = "p2" in self._out_features
+
+        # ---- 1. 載入預訓練,砍掉 Detect head,保留 backbone+neck ----
+        ymodel = YOLO(yolo_weights).model
+        layers = ymodel.model
+        self.save = ymodel.save
+        detect_idx = len(layers) - 1
+        native_taps = layers[detect_idx].f          # Detect 吃的三個索引 = 原生 P3/P4/P5
+        assert len(native_taps) == 3, f"非預期的 Detect 輸入: {native_taps}"
+        self.body = nn.ModuleList(layers[:detect_idx])
+        self._tap = {"p3": native_taps[0], "p4": native_taps[1], "p5": native_taps[2]}
+
+        # ---- 2. 動態探測 channel 數 / stride(同一份 forward 邏輯跑一次 dummy input)----
+        ch_map, stride_map, self._p2_src_idx = self._probe(need_p2)
+
+        # ---- 3. 需要 P2 時額外接一段(隨機初始化)----
+        self.extra_p2 = None
+        if need_p2:
+            c_src, c_p3 = ch_map[self._p2_src_idx], ch_map[self._tap["p3"]]
+            self.extra_p2 = _ExtraP2Stage(c_src, c_p3)
+
+        self.proj = nn.ModuleDict()
+        self._out_feature_channels, self._out_feature_strides = {}, {}
+        for lvl in self._out_features:
+            in_ch = self.extra_p2.out_channels if lvl == "p2" else ch_map[self._tap[lvl]]
+            self.proj[lvl] = Conv2d(
+                in_ch, out_channels, kernel_size=1, bias=(norm == ""),
+                norm=get_norm(norm, out_channels),
+            )
+            self._out_feature_channels[lvl] = out_channels
+            self._out_feature_strides[lvl] = stride_map[lvl]
+
+        # ---- 5. 反正規化層:ImageNet normalized -> raw(0-255) -> YOLO 0-1 ----
+        self.register_buffer("pixel_mean", torch.tensor(pixel_mean).view(1, 3, 1, 1))
+        self.register_buffer("pixel_std", torch.tensor(pixel_std).view(1, 3, 1, 1))
+
+        if freeze_backbone:
+            for p in self.body.parameters():
+                p.requires_grad = False
+
+    def _probe(self, need_p2):
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 256, 256)
+            y, ch_map = [], {}
+            x = dummy
+            stride4_idx = None
+            for m in self.body:
+                if m.f != -1:
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+                x = m(x)
+                y.append(x if m.i in self.save else None)
+                ch_map[m.i] = x.shape[1]
+                if need_p2 and dummy.shape[-1] // x.shape[-1] == 4:
+                    stride4_idx = m.i   # 持續更新,取最後一個 stride=4 的層(即進入 P3 前的 backbone 輸出)
+        self.train(was_training)
+        stride_map = {"p2": 4, "p3": 8, "p4": 16, "p5": 32}
+        if need_p2 and stride4_idx is None:
+            raise RuntimeError("在 backbone 中找不到 stride=4 的特徵圖,無法產生 P2。")
+        return ch_map, stride_map, stride4_idx
+
+    def forward(self, x):
+        # (1) ImageNet normalized -> raw RGB(0-255) -> YOLO 預期的 0-1
+        x = x * self.pixel_std + self.pixel_mean
+        x = x / 255.0
+
+        keep = set(self._tap.values())
+        if self._p2_src_idx is not None:
+            keep.add(self._p2_src_idx)
+
+        y, feats = [], {}
+        for m in self.body:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+            if m.i in keep:
+                feats[m.i] = x
+
+        outputs = {}
+        if "p2" in self._out_features:
+            p2_feat = self.extra_p2(feats[self._p2_src_idx], feats[self._tap["p3"]])
+            outputs["p2"] = self.proj["p2"](p2_feat)
+        for lvl in ("p3", "p4", "p5"):
+            if lvl in self._out_features:
+                outputs[lvl] = self.proj[lvl](feats[self._tap[lvl]])
+        return outputs
+
+    @property
+    def size_divisibility(self) -> int:
+        return 32
+
+    def output_shape(self):
+        return {
+            name: ShapeSpec(channels=self._out_feature_channels[name],
+                             stride=self._out_feature_strides[name])
+            for name in self._out_features
+        }
+
+
+@BACKBONE_REGISTRY.register()
+def build_yolo11_pan_backbone(cfg, input_shape, priors=None):
+    return YOLO11PANBackbone(
+        yolo_weights=cfg.MODEL.YOLO.WEIGHTS,          # e.g. "yolo11s.pt"
+        out_features=cfg.MODEL.YOLO.OUT_FEATURES,      # e.g. ["p2","p3","p4","p5"]
+        out_channels=cfg.MODEL.YOLO.OUT_CHANNELS,      # 256
+        norm=cfg.MODEL.YOLO.NORM,                      # "BN" / "FrozenBN" / "SyncBN"
+        pixel_mean=cfg.MODEL.PIXEL_MEAN,
+        pixel_std=cfg.MODEL.PIXEL_STD,
+        freeze_backbone=cfg.MODEL.YOLO.FREEZE_BACKBONE,
+    )
