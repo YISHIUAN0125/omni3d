@@ -15,6 +15,12 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
+from pytorch3d.transforms.rotation_conversions import _copysign
+from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, quaternion_to_matrix
+from pytorch3d.transforms.so3 import so3_relative_angle
+
+from cubercnn import util as cubeutil
+
 from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
@@ -283,6 +289,304 @@ class Detect(nn.Module):
         for name in tuple(self._modules):
             if name.startswith("one2one_"):
                 setattr(self, name[8:] if end2end else name, None)
+
+
+# -------------------------------------------------
+# Detect3D
+# -------------------------------------------------
+class Detect3D(Detect):
+    def __init__(self, 
+                 nc: int = 80, 
+                 reg_max=16, 
+                 end2end=False, 
+                 ch: tuple = (),
+                 pose_type: str = "6d",
+                 z_type: str = "direct",
+                 use_conf: bool = True,
+                 dims_priors_enabled: bool = True,
+                 virtual_depth: bool = True,
+                 virtual_focal: float = 512.0,
+                 disentangled_loss: bool = False,
+                 chamfer_pose: bool = False,
+                 allocentric_pose: bool = True,
+                 dims_priors_func = None,
+                 cluster_bins: int = 0,
+                 priors = None,
+                 ):
+        super().__init__(nc=nc, reg_max=reg_max, end2end=True, ch=ch)
+        self.end2end = end2end
+        self.pose_type = pose_type
+        self.use_conf = use_conf
+        self.dims_priors_enabled = dims_priors_enabled
+        self.virtual_depth = virtual_depth
+        self.virtual_focal = virtual_focal
+        self.z_type = z_type
+        self.disentangled_loss = disentangled_loss
+        self.chamfer_pose = chamfer_pose
+        self.allocentric_pose = allocentric_pose
+        self.dims_priors_func = dims_priors_func
+        self.cluster_bins = cluster_bins
+        self.priors = priors
+        pose_dim = {"6d": 6, "quaternion": 4, "euler": 3}[pose_type]
+        c4 = max(ch[0], min(self.nc, 100))
+
+        if self.dims_priors_enabled and priors is not None and "priors_dims_per_cat" in priors:
+            self.priors_dims_per_cat = nn.Parameter(
+                torch.as_tensor(priors["priors_dims_per_cat"], dtype=torch.float32).unsqueeze(0)
+            )
+        else:
+            self.priors_dims_per_cat = nn.Parameter(torch.ones(1, self.nc, 2, 3))
+
+        if self.cluster_bins > 1 and priors is not None and "priors_bins" in priors:
+            priors_z_scales = torch.stack([
+                torch.as_tensor(prior[1], dtype=torch.float32) for prior in priors["priors_bins"]
+            ])
+            self.priors_z_scales = nn.Parameter(priors_z_scales)
+        else:
+            self.priors_z_scales = nn.Parameter(torch.ones(self.nc, max(self.cluster_bins, 1)))
+
+        if self.z_type == "clusters":
+            assert self.cluster_bins > 1, "To use z_type of priors, there must be more than 1 cluster bin"
+            if priors is None or "priors_bins" not in priors:
+                self.priors_z_stats = nn.Parameter(torch.ones(self.nc, self.cluster_bins, 2))
+            else:
+                priors_z_stats = torch.cat([
+                    torch.as_tensor(prior[2], dtype=torch.float32).unsqueeze(0) for prior in priors["priors_bins"]
+                ])
+                self.priors_z_stats = nn.Parameter(priors_z_stats)
+
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
+        self.cube_tower = MLP(c4, c4, c4, 2, nn.SiLU, False, residual=True, out_norm=nn.LayerNorm(c4))
+        self.cube_2d_deltas_pred = nn.Linear(c4, 2)
+        self.cube_dims_pred = nn.Linear(c4, 3)
+        self.cube_pose_pred = nn.Linear(c4, pose_dim)
+        self.cube_z_pred = nn.Linear(c4, 1)
+        if self.use_conf:
+            self.cube_uncert_pred = nn.Linear(c4, 1)
+
+        if dims_priors_enabled:
+            self.priors_dims_per_cat = nn.Parameter(torch.ones(1, nc, 2, 3))
+
+        self._init_cube_weights(self.cube_2d_deltas_pred, self.cube_dims_pred,
+                                 self.cube_pose_pred, getattr(self, "cube_uncert_pred", None))
+
+        self.one2one_cv4 = copy.deepcopy(self.cv4)
+        self.one2one_cube_tower = copy.deepcopy(self.cube_tower)
+        self.one2one_cube_2d_deltas_pred = copy.deepcopy(self.cube_2d_deltas_pred)
+        self.one2one_cube_dims_pred = copy.deepcopy(self.cube_dims_pred)
+        self.one2one_cube_pose_pred = copy.deepcopy(self.cube_pose_pred)
+        self.one2one_cube_z_pred = copy.deepcopy(self.cube_z_pred)
+        if self.use_conf:
+            self.one2one_cube_uncert_pred = copy.deepcopy(self.cube_uncert_pred)
+
+    def _init_cube_weights(self, deltas, dims, pose, uncert):
+        for p in (deltas, dims, pose):
+            nn.init.normal_(p.weight, std=0.001)
+            nn.init.constant_(p.bias, 0.0)
+        if uncert is not None:
+            nn.init.normal_(uncert.weight, std=0.001)
+            nn.init.constant_(uncert.bias, 5.0)
+
+    @property
+    def cube_one2many(self) -> dict[str, nn.Module]:
+        return{
+            "cube_tower": self.cube_tower,
+            "deltas_head": self.cube_2d_deltas_pred,
+            "dims_head": self.cube_dims_pred,
+            "pose_head": self.cube_pose_pred,
+            "z_head": self.cube_z_pred,
+            "uncert_head": getattr(self, "cube_uncert_pred", None),            
+        }
+
+    @property
+    def cube_one2one(self) -> dict[str, nn.Module]:
+        return {
+            "cube_tower": self.one2one_cube_tower,
+            "deltas_head": self.one2one_cube_2d_deltas_pred,
+            "dims_head": self.one2one_cube_dims_pred,
+            "pose_head": self.one2one_cube_pose_pred,
+            "z_head": self.one2one_cube_z_pred,
+            "uncert_head": getattr(self, "one2one_cube_uncert_pred", None),
+        }
+
+    def _run_3d_mlp(
+        self,
+        point_features: torch.Tensor,
+        cube_tower: nn.Module,
+        deltas_head: nn.Module,
+        dims_head: nn.Module,
+        pose_head: nn.Module,
+        z_head: nn.Module,
+        uncert_head: nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        cube_feat = cube_tower(point_features)
+        preds = {
+            "deltas": deltas_head(cube_feat),
+            "dims": dims_head(cube_feat),
+            "pose": pose_head(cube_feat),
+            "z": z_head(cube_feat),
+        }
+        if uncert_head is not None:
+            preds["uncert"] = uncert_head(cube_feat).clamp(min=0.01).squeeze(-1)
+        return preds
+
+    def decode_cube(
+        self,
+        cube_preds: dict[str, torch.Tensor],
+        box_classes: torch.Tensor,
+        src_boxes: torch.Tensor,
+        Ks_scaled_per_box: torch.Tensor, # Scaled Ks per box
+        focal_lengths: torch.Tensor,
+        im_scales_orig: torch.Tensor,
+        im_scales: torch.Tensor,
+    ):
+        n = box_classes.shape[0]
+        fg_inds = torch.arange(n, device=box_classes.device)
+
+        src_w = (src_boxes[:, 2] - src_boxes[:, 0]).clamp(min=1.0)
+        src_h = (src_boxes[:, 3] - src_boxes[:, 1]).clamp(min=1.0)
+        src_cx = (src_boxes[:, 0] + src_boxes[:, 2]) * 0.5
+        src_cy = (src_boxes[:, 1] + src_boxes[:, 3]) * 0.5
+
+        cube_x = src_cx + src_w * cube_preds["deltas"][:, 0]
+        cube_y = src_cy + src_h * cube_preds["deltas"][:, 1]
+        cube_xy = torch.stack([cube_x, cube_y], dim=1)
+
+        dims_norm = cube_preds["dims"].clamp(min=-5.0, max=5.0)
+        if self.dims_priors_enabled:
+            prior_dims = self.priors_dims_per_cat.detach()[0, box_classes]  # (N, 2, 3)
+            prior_mean = prior_dims[:, 0, :]
+            prior_std = prior_dims[:, 1, :]
+
+            dims_func = getattr(self, "dims_priors_func", None)
+            if dims_func == "sigmoid":
+                prior_min = (prior_mean - 3 * prior_std).clamp(min=0.0)
+                prior_max = (prior_mean + 3 * prior_std)
+                cube_dims = cubeutil.scaled_sigmoid(cube_preds["dims"], min=prior_min, max=prior_max)
+            else:
+                cube_dims = torch.exp(cube_preds["dims"].clamp(max=5)) * prior_mean
+        else:
+            cube_dims = torch.exp(dims_norm)
+
+        if self.pose_type == "6d":
+            cube_pose = rotation_6d_to_matrix(cube_preds["pose"])
+        elif self.pose_type == "quaternion":
+            q = cube_preds["pose"]
+            q = q / _copysign(torch.sqrt((q * q).sum(1)), q[:, 0])[:, None]
+            cube_pose = quaternion_to_matrix(q)
+        else:
+            cube_pose = euler_angles_to_matrix(cube_preds["pose"], "XYZ")
+
+        z_raw = cube_preds["z"][:, 0]
+
+        if self.z_type == "clusters" and self.cluster_bins > 1:
+            src_scales = (src_h**2 + src_w**2).sqrt()
+
+            scales_diff = (self.priors_z_scales.detach().T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
+            assignments = scales_diff.argmin(1)  # (N, nc)
+            assigned_bins = assignments[fg_inds, box_classes]
+
+            z_raw = cube_preds["z"].gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
+
+            z_stats = self.priors_z_stats.detach()
+            z_means = z_stats[:, :, 0].T.unsqueeze(0).repeat([n, 1, 1])
+            z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
+
+            z_stds = z_stats[:, :, 1].T.unsqueeze(0).repeat([n, 1, 1])
+            z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
+
+            z_mins = (z_means - 3 * z_stds).clamp(min=0.0)
+            z_maxs = (z_means + 3 * z_stds)
+            cube_z = cubeutil.scaled_sigmoid(z_raw, min=z_mins, max=z_maxs)
+
+        elif self.z_type == "sigmoid":
+            cube_z = torch.sigmoid(z_raw) * 100
+        elif self.z_type == "log":
+            cube_z = torch.exp(z_raw.clamp(min=-5, max=8))
+        else:  # direct
+            cube_z = z_raw
+
+        if self.virtual_depth:
+            cube_z = cube_z * (focal_lengths / self.virtual_focal) * (im_scales_orig / im_scales)
+
+        cube_x3d = cube_z * (cube_x - Ks_scaled_per_box[:, 0, 2]) / Ks_scaled_per_box[:, 0, 0]
+        cube_y3d = cube_z * (cube_y -Ks_scaled_per_box[:, 1, 2]) / Ks_scaled_per_box[:, 1, 1]
+        cube_center_cam = torch.stack([cube_x3d, cube_y3d, cube_z], dim=-1)
+
+        if self.allocentric_pose == True:
+            cube_pose = cubeutil.R_from_allocentric(Ks_scaled_per_box, cube_pose, u=cube_x.detach(), v=cube_y.detach())
+
+        out = {
+            "center_cam": cube_center_cam,
+            "center_2d": cube_xy,
+            "dims": cube_dims,
+            "pose": cube_pose,
+            "z": cube_z,
+            "raw_dims": cube_preds["dims"],
+            "raw_z": z_raw,
+            "raw_deltas": cube_preds["deltas"],
+        }
+
+        if self.use_conf and "uncert" in cube_preds:
+            out["conf"] = torch.exp(-cube_preds["uncert"])
+
+        return out
+
+    def forward_cube(self, x: list[torch.Tensor], cv4: nn.ModuleList) -> torch.Tensor:
+        bs = x[0].shape[0]
+        c4 = cv4[0][-1].conv.out_channels if hasattr(cv4[0][-1], "conv") else cv4[0][-1].out_channels
+        feats = torch.cat(
+            [cv4[i](x[i]).view(bs, c4, -1) for i in range(self.nl)], dim=-1
+        )
+        return feats.transpose(1, 2)  # (bs, total_anchors, c4)
+
+    def forward(self, x: list[torch.Tensor]):
+        preds = self.forward_head(x, **self.one2many)
+        preds["cube_feats"] = self.forward_cube(x, self.cv4)
+
+        x_detach = [xi.detach() for xi in x] if self.training else x
+        one2one = self.forward_head(x_detach, **self.one2one)
+        one2one["cube_feats"] = self.forward_cube(x_detach, self.one2one_cv4)
+
+        if self.training:
+            if getattr(self, "one2one_cv4", None) is not None:
+                preds = {"one2many": preds, "one2one": one2one}
+            return preds
+
+        use_one2one = self.end2end and getattr(self, "one2one_cv2", None) is not None
+        base = one2one if use_one2one else preds
+        cube_feats = one2one["cube_feats"] if use_one2one else preds["cube_feats"]
+        cube_modules = self.cube_one2one if use_one2one else self.cube_one2many
+
+        y = self._inference(base)  # (bs, 4 + nc, total_anchors)
+
+        if self.end2end:
+            y, cube_preds = self.postprocess(y.permute(0, 2, 1), cube_feats, cube_modules)
+            return y if self.export else (y, cube_preds, preds)
+
+        return (y, cube_feats) if self.export else (y, cube_feats, preds)
+
+    def postprocess(
+        self, 
+        preds: torch.Tensor, 
+        cube_feats: torch.Tensor, 
+        cube_modules: dict[str, nn.Module]
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+
+        boxes, scores, *extra = preds.split([s for s in (4, self.nc, preds.shape[-1] - 4 - self.nc) if s], dim=-1)
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+
+        # (bs, max_det, 6 + extra)
+        pred_2d = torch.cat(
+            [self._gather(boxes, idx), scores, conf, *(self._gather(e, idx) for e in extra)], 
+            dim=-1
+        )
+
+        # (bs, max_det, c4)
+        topk_cube_feats = self._gather(cube_feats, idx)
+        cube_preds = self._run_3d_mlp(topk_cube_feats, **cube_modules)
+
+        return pred_2d, cube_preds
 
 
 class Segment(Detect):
