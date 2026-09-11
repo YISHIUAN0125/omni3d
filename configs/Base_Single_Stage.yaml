@@ -42,7 +42,7 @@ MODEL:
   DLA:
     TYPE: 'dla34'
   YOLO:
-    WEIGHTS: "yolo11m.pt"
+    WEIGHTS: "pretrained/yolo11m.pt"
     NORM: "BN"
     OUT_CHANNELS: 256
     OUT_FEATURES: ['p3', 'p4', 'p5']
