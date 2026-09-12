@@ -76,6 +76,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    Detect3D
 )
 from ultralytics.utils import (
     DEFAULT_CFG_DICT,
@@ -99,6 +100,8 @@ from ultralytics.utils.loss import (
     v8OBBLoss,
     v8PoseLoss,
     v8SegmentationLoss,
+    Detect3DLoss,
+    E2EDetect3DLoss
 )
 from ultralytics.utils.ops import make_divisible
 from ultralytics.utils.patches import torch_load
@@ -600,6 +603,18 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2ELoss(self) if getattr(self.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss(self)
+
+
+class Detection3DModel(DetectionModel):
+    def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        return (
+            E2EDetect3DLoss(self)
+            if getattr(self.model[-1], "one2one_cv4", None) is not None
+            else Detect3DLoss(self)
+        )
 
 
 class OBBModel(DetectionModel):
@@ -2155,6 +2170,7 @@ def parse_model(d, ch, verbose=True):
                 Pose26,
                 OBB,
                 OBB26,
+                Detect3D
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
@@ -2255,6 +2271,8 @@ def guess_model_task(model):
         m = cfg["head"][-1][-2].lower()  # output module name
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
+        if "detect3d" in m:
+            return "detect3d"
         if "detect" in m:
             return "detect"
         if "semanticsegment" in m:
@@ -2281,6 +2299,8 @@ def guess_model_task(model):
             with contextlib.suppress(Exception):
                 return cfg2task(eval(x))  # nosec B307: safe eval of known attribute paths
         for m in model.modules():
+            if isinstance(m, Detect3D):
+                return "detect3d"
             if isinstance(m, SemanticSegment):
                 return "semantic"
             elif isinstance(m, (Segment, YOLOESegment)):

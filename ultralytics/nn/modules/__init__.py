@@ -94,6 +94,7 @@ from .head import (
     YOLOESegment,
     YOLOESegment26,
     v10Detect,
+    Detect3D
 )
 from .transformer import (
     AIFI,
@@ -191,4 +192,5 @@ __all__ = (
     "YOLOESegment",
     "YOLOESegment26",
     "v10Detect",
+    "Detect3D"
 )

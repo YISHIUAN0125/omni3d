@@ -25,6 +25,7 @@ from ultralytics.nn.tasks import (
     WorldModel,
     YOLOEModel,
     YOLOESegModel,
+    Detection3DModel
 )
 from ultralytics.utils import ROOT, YAML
 
@@ -110,6 +111,12 @@ class YOLO(Model):
                 "trainer": yolo.detect.DetectionTrainer,
                 "validator": yolo.detect.DetectionValidator,
                 "predictor": yolo.detect.DetectionPredictor,
+            },
+            "detect3d": {
+                "model": Detection3DModel,
+                "trainer": None,
+                "validator": None,
+                "predictor": None,
             },
             "segment": {
                 "model": SegmentationModel,
