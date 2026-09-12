@@ -331,41 +331,39 @@ class Detect3D(Detect):
         c4 = max(ch[0], min(self.nc, 100))
 
         if self.dims_priors_enabled and priors is not None and "priors_dims_per_cat" in priors:
-            self.priors_dims_per_cat = nn.Parameter(
-                torch.as_tensor(priors["priors_dims_per_cat"], dtype=torch.float32).unsqueeze(0)
-            )
+            priors_dims = torch.as_tensor(priors["priors_dims_per_cat"], dtype=torch.float32).unsqueeze(0)
         else:
-            self.priors_dims_per_cat = nn.Parameter(torch.ones(1, self.nc, 2, 3))
+            priors_dims = torch.ones(1, self.nc, 2, 3)
+        self.register_buffer("priors_dims_per_cat", priors_dims, persistent=True)
 
+        # 2. 深度尺度先驗 (Z Scales)
         if self.cluster_bins > 1 and priors is not None and "priors_bins" in priors:
             priors_z_scales = torch.stack([
                 torch.as_tensor(prior[1], dtype=torch.float32) for prior in priors["priors_bins"]
             ])
-            self.priors_z_scales = nn.Parameter(priors_z_scales)
         else:
-            self.priors_z_scales = nn.Parameter(torch.ones(self.nc, max(self.cluster_bins, 1)))
+            priors_z_scales = torch.ones(self.nc, max(self.cluster_bins, 1))
+        self.register_buffer("priors_z_scales", priors_z_scales, persistent=True)
 
+        # 3. 深度統計量先驗 (Z Stats)
         if self.z_type == "clusters":
             assert self.cluster_bins > 1, "To use z_type of priors, there must be more than 1 cluster bin"
             if priors is None or "priors_bins" not in priors:
-                self.priors_z_stats = nn.Parameter(torch.ones(self.nc, self.cluster_bins, 2))
+                priors_z_stats = torch.ones(self.nc, self.cluster_bins, 2)
             else:
                 priors_z_stats = torch.cat([
                     torch.as_tensor(prior[2], dtype=torch.float32).unsqueeze(0) for prior in priors["priors_bins"]
                 ])
-                self.priors_z_stats = nn.Parameter(priors_z_stats)
+            self.register_buffer("priors_z_stats", priors_z_stats, persistent=True)
 
         self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
         self.cube_tower = MLP(c4, c4, c4, 2, nn.SiLU, False, residual=True, out_norm=nn.LayerNorm(c4))
         self.cube_2d_deltas_pred = nn.Linear(c4, 2)
         self.cube_dims_pred = nn.Linear(c4, 3)
         self.cube_pose_pred = nn.Linear(c4, pose_dim)
-        self.cube_z_pred = nn.Linear(c4, 1)
+        self.cube_z_pred = nn.Linear(c4, max(cluster_bins, 1))
         if self.use_conf:
             self.cube_uncert_pred = nn.Linear(c4, 1)
-
-        if dims_priors_enabled:
-            self.priors_dims_per_cat = nn.Parameter(torch.ones(1, nc, 2, 3))
 
         self._init_cube_weights(self.cube_2d_deltas_pred, self.cube_dims_pred,
                                  self.cube_pose_pred, getattr(self, "cube_uncert_pred", None))
@@ -477,37 +475,39 @@ class Detect3D(Detect):
         else:
             cube_pose = euler_angles_to_matrix(cube_preds["pose"], "XYZ")
 
-        z_raw = cube_preds["z"][:, 0]
-
+        z_raw = cube_preds["z"]
         if self.z_type == "clusters" and self.cluster_bins > 1:
             src_scales = (src_h**2 + src_w**2).sqrt()
-
-            scales_diff = (self.priors_z_scales.detach().T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
-            assignments = scales_diff.argmin(1)  # (N, nc)
+            scales_diff = (self.priors_z_scales.T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
+            assignments = scales_diff.argmin(1)
             assigned_bins = assignments[fg_inds, box_classes]
 
-            z_raw = cube_preds["z"].gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
-
-            z_stats = self.priors_z_stats.detach()
-            z_means = z_stats[:, :, 0].T.unsqueeze(0).repeat([n, 1, 1])
+            z_means = self.priors_z_stats[:, :, 0].T.unsqueeze(0).repeat([n, 1, 1])
             z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
-
-            z_stds = z_stats[:, :, 1].T.unsqueeze(0).repeat([n, 1, 1])
+            z_stds = self.priors_z_stats[:, :, 1].T.unsqueeze(0).repeat([n, 1, 1])
             z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
 
             z_mins = (z_means - 3 * z_stds).clamp(min=0.0)
             z_maxs = (z_means + 3 * z_stds)
-            cube_z = cubeutil.scaled_sigmoid(z_raw, min=z_mins, max=z_maxs)
+
+            z_sel = z_raw.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)  # 依 bin 選值，這行是新增的關鍵
+            cube_z = cubeutil.scaled_sigmoid(z_sel, min=z_mins, max=z_maxs)
 
         elif self.z_type == "sigmoid":
-            cube_z = torch.sigmoid(z_raw) * 100
+            cube_z = torch.sigmoid(z_raw[:, 0]) * 100
         elif self.z_type == "log":
-            cube_z = torch.exp(z_raw.clamp(min=-5, max=8))
+            cube_z = torch.exp(z_raw[:, 0].clamp(min=-5, max=8))
         else:  # direct
-            cube_z = z_raw
+            cube_z = z_raw[:, 0]
 
         if self.virtual_depth:
-            cube_z = cube_z * (focal_lengths / self.virtual_focal) * (im_scales_orig / im_scales)
+            virtual_to_real = cubeutil.compute_virtual_scale_from_focal_spaces(
+                focal_lengths,
+                im_scales_orig,       
+                self.virtual_focal,   
+                im_scales             
+            )
+            cube_z = cube_z * virtual_to_real
 
         cube_x3d = cube_z * (cube_x - Ks_scaled_per_box[:, 0, 2]) / Ks_scaled_per_box[:, 0, 0]
         cube_y3d = cube_z * (cube_y -Ks_scaled_per_box[:, 1, 2]) / Ks_scaled_per_box[:, 1, 1]
@@ -562,7 +562,7 @@ class Detect3D(Detect):
 
         if self.end2end:
             y, cube_preds = self.postprocess(y.permute(0, 2, 1), cube_feats, cube_modules)
-            return y if self.export else (y, cube_preds, preds)
+            return (y, cube_preds) if self.export else (y, cube_preds, preds)
 
         return (y, cube_feats) if self.export else (y, cube_feats, preds)
 
