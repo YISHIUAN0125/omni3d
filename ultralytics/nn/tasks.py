@@ -2170,7 +2170,6 @@ def parse_model(d, ch, verbose=True):
                 Pose26,
                 OBB,
                 OBB26,
-                Detect3D
             }
         ):
             args.extend([reg_max, end2end, [ch[x] for x in f]])
@@ -2180,6 +2179,9 @@ def parse_model(d, ch, verbose=True):
                 m.legacy = legacy
         elif m is Depth:
             args = [*args[:1], [ch[x] for x in f]]  # c_mid, ch tuple; drops the legacy mode arg old checkpoints store
+        elif m is Detect3D: # Add detect 3D
+            args.append([ch[x] for x in f])
+            m.legacy = legacy
         elif m is SemanticSegment:
             args.append([ch[x] for x in f])  # nc, ch tuple
         elif m is v10Detect:
