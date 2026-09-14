@@ -169,3 +169,4 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.YOLO3D.TIME_UNIT = "iter"
     cfg.MODEL.YOLO3D.EPOCHS = 0.0
     cfg.MODEL.PRETRAINED_WEIGHTS = ""
+    cfg.SOLVER.WEIGHT_DECAY = 0.005
