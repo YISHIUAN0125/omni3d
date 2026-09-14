@@ -160,3 +160,12 @@ def get_cfg_defaults(cfg):
     cfg.MODEL.YOLO.OUT_CHANNELS = 256
     cfg.MODEL.YOLO.OUT_FEATURES = ['p3', 'p4', 'p5']
     cfg.MODEL.YOLO.FREEZE_BACKBONE = False
+
+
+    cfg.MODEL.INPUT_FORMAT = "BGR"
+    cfg.MODEL.YOLO3D = CN()
+    cfg.MODEL.YOLO3D.ARCH = "configs/YOLO3D.yaml"
+    cfg.MODEL.YOLO3D.IS_E2E = True
+    cfg.MODEL.YOLO3D.TIME_UNIT = "iter"
+    cfg.MODEL.YOLO3D.EPOCHS = 0.0
+    cfg.MODEL.PRETRAINED_WEIGHTS = ""
