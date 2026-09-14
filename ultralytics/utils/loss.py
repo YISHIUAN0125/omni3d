@@ -763,9 +763,13 @@ class Detect3DLoss(v8DetectionLoss):
                 target_bboxes / stride_tensor, target_scores, target_scores_sum,
                 fg_mask, imgsz, stride_tensor,
             )
-        loss[0] *= self.hyp.box
-        loss[1] *= self.hyp.cls
-        loss[2] *= self.hyp.dfl
+        # print(self.hyp.keys())
+        loss[0] *= self.hyp["box"]
+        loss[1] *= self.hyp["cls"]
+        loss[2] *= self.hyp["dfl"]
+        # loss[0] *= self.hyp.box
+        # loss[1] *= self.hyp.cls
+        # loss[2] *= self.hyp.dfl
 
         return (
             (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor,
@@ -779,7 +783,6 @@ class Detect3DLoss(v8DetectionLoss):
     def loss(
         self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-
         branch = preds["one2one"] if self.is_one2one else preds["one2many"]
 
         (
@@ -874,6 +877,10 @@ class Detect3DLoss(v8DetectionLoss):
 
         return loss * batch_size, loss_items
 
+    def to(self, device):
+        self.device = torch.device(device)
+        return self
+
 class E2EDetect3DLoss:
     """Criterion class for end-to-end (one2many + one2one dual head) 3D detection."""
 
@@ -916,6 +923,11 @@ class E2EDetect3DLoss:
     def decay(self, x: int) -> float:
         epochs = max(getattr(self.one2one.hyp, "epochs", 100) - 1, 1) # Need to align iter and epoch
         return max(1.0 - x / epochs, 0.0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
+
+    def to(self, device):
+        self.one2many.to(device)
+        self.one2one.to(device)
+        return self
 
 
 class v8SegmentationLoss(v8DetectionLoss):
