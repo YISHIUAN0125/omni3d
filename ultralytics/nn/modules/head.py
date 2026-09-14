@@ -295,24 +295,25 @@ class Detect(nn.Module):
 # Detect3D
 # -------------------------------------------------
 class Detect3D(Detect):
-    def __init__(self, 
-                 nc: int = 80, 
-                 reg_max=16, 
-                 end2end=False, 
-                 ch: tuple = (),
-                 pose_type: str = "6d",
-                 z_type: str = "direct",
-                 use_conf: bool = True,
-                 dims_priors_enabled: bool = True,
-                 virtual_depth: bool = True,
-                 virtual_focal: float = 512.0,
-                 disentangled_loss: bool = False,
-                 chamfer_pose: bool = False,
-                 allocentric_pose: bool = True,
-                 dims_priors_func = None,
-                 cluster_bins: int = 0,
-                 priors = None,
-                 ):
+    def __init__(
+        self,
+        nc: int = 80,
+        pose_type: str = "6d",
+        z_type: str = "direct",
+        use_conf: bool = True,
+        dims_priors_enabled: bool = True,
+        virtual_depth: bool = True,
+        virtual_focal: float = 512.0,
+        disentangled_loss: bool = False,
+        chamfer_pose: bool = False,
+        allocentric_pose: bool = True,
+        dims_priors_func=None,
+        cluster_bins: int = 0,
+        priors=None,
+        reg_max: int = 16,
+        end2end: bool = True,
+        ch: tuple = (),
+    ):
         super().__init__(nc=nc, reg_max=reg_max, end2end=True, ch=ch)
         self.end2end = end2end
         self.pose_type = pose_type
@@ -427,6 +428,29 @@ class Detect3D(Detect):
         if uncert_head is not None:
             preds["uncert"] = uncert_head(cube_feat).clamp(min=0.01).squeeze(-1)
         return preds
+
+    def set_priors(self, priors: dict):
+        if priors is None:
+            return
+        self.priors = priors
+        dev = self.priors_dims_per_cat.device
+        dt = self.priors_dims_per_cat.dtype
+
+        if "priors_dims_per_cat" in priors:
+            dims = torch.as_tensor(priors["priors_dims_per_cat"], dtype=dt, device=dev).unsqueeze(0)
+            self.priors_dims_per_cat.copy_(dims)
+
+        if "priors_bins" in priors and self.cluster_bins > 1:
+            z_scales = torch.stack([
+                torch.as_tensor(prior[1], dtype=dt, device=dev) for prior in priors["priors_bins"]
+            ])
+            self.priors_z_scales.copy_(z_scales)
+
+            if self.z_type == "clusters":
+                z_stats = torch.cat([
+                    torch.as_tensor(prior[2], dtype=dt, device=dev).unsqueeze(0) for prior in priors["priors_bins"]
+                ])
+                self.priors_z_stats.copy_(z_stats)
 
     def decode_cube(
         self,
