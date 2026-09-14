@@ -74,3 +74,22 @@ def freeze_bn(network):
         if isinstance(module, torch.nn.BatchNorm2d):
             module.eval()
             module.track_running_stats = False
+
+def build_optimizer_yolo3d(cfg, model):
+    g_decay, g_no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim == 1 or name.endswith(".bias"):
+            g_no_decay.append(p)
+        else:
+            g_decay.append(p)
+
+    return torch.optim.AdamW(
+        [
+            {"params": g_decay, "weight_decay": cfg.SOLVER.WEIGHT_DECAY},
+            {"params": g_no_decay, "weight_decay": 0.0},
+        ],
+        lr=cfg.SOLVER.BASE_LR,
+        betas=(0.9, 0.999),
+    )
