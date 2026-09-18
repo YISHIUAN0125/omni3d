@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 # 0 is disabled on GPU. 
 MAX_DTS_CROSS_GTS_FOR_IOU3D = 0
 
+# Visibility-aware AP3D protocol. The ranges are half-open [low, high),
+# except Easy whose upper bound is slightly above 1.0 to include vis == 1.0.
+VISIBILITY_RANGES = OrderedDict([
+    ("hard", (0.0, 0.3)),
+    ("medium", (0.3, 0.7)),
+    ("easy", (0.7, 1.0 + 1e-10)),
+])
+
 
 def _check_coplanar(boxes: torch.Tensor, eps: float = 1e-4) -> torch.BoolTensor:
     """
@@ -356,11 +364,23 @@ class Omni3DEvaluationHelper:
             extras_APm = results['bbox_3D']['APm']
             extras_APf = results['bbox_3D']['APf']
 
+        # Visibility-aware AP3D. Missing annotations or empty buckets remain NaN,
+        # which is semantically different from AP=0.
+        visibility_metrics = {}
+        for bucket in VISIBILITY_RANGES:
+            bucket_result = results.get("bbox_3D_visibility_{}".format(bucket), {})
+            suffix = {"hard": "H", "medium": "M", "easy": "E"}[bucket]
+            visibility_metrics["AP3D-Occ-{}".format(suffix)] = bucket_result.get("AP", np.nan)
+            visibility_metrics["AP3D@15-Occ-{}".format(suffix)] = bucket_result.get("AP15", np.nan)
+            visibility_metrics["AP3D@25-Occ-{}".format(suffix)] = bucket_result.get("AP25", np.nan)
+            visibility_metrics["AP3D@50-Occ-{}".format(suffix)] = bucket_result.get("AP50", np.nan)
+
         self.results_analysis[dataset_name] = {
-            "iters": self.iter_label, 
-            "AP2D": general_2D, "AP3D": general_3D, 
-            "AP3D@15": extras_AP15, "AP3D@25": extras_AP25, "AP3D@50": extras_AP50, 
-            "AP3D-N": extras_APn, "AP3D-M": extras_APm, "AP3D-F": extras_APf
+            "iters": self.iter_label,
+            "AP2D": general_2D, "AP3D": general_3D,
+            "AP3D@15": extras_AP15, "AP3D@25": extras_AP25, "AP3D@50": extras_AP50,
+            "AP3D-N": extras_APn, "AP3D-M": extras_APm, "AP3D-F": extras_APf,
+            **visibility_metrics,
         }
 
         # Performance per category
@@ -928,9 +948,599 @@ class Omni3DEvaluator(COCOEvaluator):
                 self._results[task + "_" + format(mode) + '_evals_per_cat_area'] = evals[mode].evals_per_cat_area
 
             self._results["log_str_2D"] = log_strs["2D"]
-            
             if "3D" in log_strs:
                 self._results["log_str_3D"] = log_strs["3D"]
+
+            # Run conditional AP3D only when 3D evaluation is enabled. Datasets
+            # without legal visibility annotations (for example ARKitScenes)
+            # are skipped and reported as NaN/N/A instead of AP=0.
+            if not self._only_2d and len(omni_results) > 0:
+                (
+                    visibility_evals,
+                    visibility_logs,
+                    visibility_counts,
+                    visibility_class_counts,
+                ) = _evaluate_visibility_ap3d(
+                        self._omni_api,
+                        omni_results,
+                        iou_type=task,
+                        img_ids=img_ids,
+                        eval_prox=self._eval_prox,
+                    )
+                self._results["bbox_3D_visibility_counts"] = visibility_counts
+                self._results[
+                    "bbox_3D_visibility_class_counts"
+                ] = visibility_class_counts
+                visibility_summary_rows = []
+                visibility_class_results = OrderedDict()
+
+                for bucket in VISIBILITY_RANGES:
+                    evaluator = visibility_evals.get(bucket)
+                    result_key = "bbox_3D_visibility_{}".format(bucket)
+                    gt_count = int(visibility_counts.get(bucket, 0))
+
+                    bucket_title = {
+                        "hard": "HARD [0.0, 0.3)",
+                        "medium": "MEDIUM [0.3, 0.7)",
+                        "easy": "EASY [0.7, 1.0]",
+                    }[bucket]
+
+                    self._logger.info(
+                        "\n%s\nVisibility-aware AP3D: %s\nValid GT objects: %d\n%s",
+                        "=" * 78,
+                        bucket_title,
+                        gt_count,
+                        "=" * 78,
+                    )
+
+                    if evaluator is None:
+                        bucket_result = {
+                            metric: float("nan")
+                            for metric in [
+                                "AP", "AP15", "AP25", "AP50", "APn", "APm", "APf"
+                            ]
+                        }
+                        self._logger.info(
+                            "Visibility-aware AP3D for %s is N/A because no valid GT exists.",
+                            bucket.upper(),
+                        )
+                    else:
+                        # Suppress the very long per-category table for each visibility
+                        # bucket. The aggregate AP metrics are printed in the summary below.
+                        bucket_result = {
+                            metric: float(
+                                evaluator.stats[index] * 100
+                                if evaluator.stats[index] >= 0
+                                else "nan"
+                            )
+                            for index, metric in enumerate(
+                                ["AP", "AP15", "AP25", "AP50", "APn", "APm", "APf"]
+                            )
+                        }
+
+                    self._results[result_key] = bucket_result
+                    self._results["log_str_3D_visibility_{}".format(bucket)] = (
+                        visibility_logs.get(bucket, "N/A: no valid visibility GT")
+                    )
+
+                    class_result = _extract_class_conditioned_ap3d(
+                        evaluator,
+                        self._metadata.get("thing_classes"),
+                    )
+                    bucket_class_counts = visibility_class_counts.get(bucket, {})
+                    for category_name, metrics in class_result.items():
+                        metrics["GT"] = int(bucket_class_counts.get(category_name, 0))
+                    visibility_class_results[bucket] = class_result
+                    self._results[
+                        "bbox_3D_visibility_class_conditioned_{}".format(bucket)
+                    ] = class_result
+
+                    visibility_summary_rows.append({
+                        "condition": bucket.upper(),
+                        "gt": gt_count,
+                        "AP": bucket_result.get("AP", float("nan")),
+                        "AP15": bucket_result.get("AP15", float("nan")),
+                        "AP25": bucket_result.get("AP25", float("nan")),
+                        "AP50": bucket_result.get("AP50", float("nan")),
+                    })
+
+                summary_lines = [
+                    "",
+                    "=" * 82,
+                    "VISIBILITY-AWARE AP3D SUMMARY",
+                    "=" * 82,
+                    "{:<10} {:>10} {:>10} {:>10} {:>10} {:>10}".format(
+                        "Condition", "GT", "AP3D", "AP15", "AP25", "AP50"
+                    ),
+                    "-" * 82,
+                ]
+
+                for row in visibility_summary_rows:
+                    summary_lines.append(
+                        "{:<10} {:>10d} {:>10.3f} {:>10.3f} {:>10.3f} {:>10.3f}".format(
+                            row["condition"],
+                            row["gt"],
+                            row["AP"],
+                            row["AP15"],
+                            row["AP25"],
+                            row["AP50"],
+                        )
+                    )
+
+                summary_lines.append("=" * 82)
+                self._logger.info("\n".join(summary_lines))
+
+                # -------------------------------------------------------------
+                # Fixed-depth comparison. These are the official Omni3D ranges:
+                # near=[0,10), medium=[10,35), far=[35,inf).
+                # -------------------------------------------------------------
+                fixed_depth_lines = [
+                    "",
+                    "=" * 94,
+                    "VISIBILITY-CONDITIONED AP3D AT FIXED DEPTH RANGES",
+                    "Official depth ranges: Near [0,10), Medium [10,35), Far [35,inf)",
+                    "=" * 94,
+                    "{:<10} {:>10} {:>12} {:>12} {:>12}".format(
+                        "Condition", "GT", "AP3D-N", "AP3D-M", "AP3D-F"
+                    ),
+                    "-" * 94,
+                ]
+                for row in visibility_summary_rows:
+                    bucket_key = row["condition"].lower()
+                    result = self._results.get(
+                        "bbox_3D_visibility_{}".format(bucket_key), {}
+                    )
+                    fixed_depth_lines.append(
+                        "{:<10} {:>10d} {:>12} {:>12} {:>12}".format(
+                            row["condition"],
+                            row["gt"],
+                            _format_number(result.get("APn", float("nan"))),
+                            _format_number(result.get("APm", float("nan"))),
+                            _format_number(result.get("APf", float("nan"))),
+                        )
+                    )
+                fixed_depth_lines.append("=" * 94)
+                self._logger.info("\n".join(fixed_depth_lines))
+
+                # -------------------------------------------------------------
+                # Class-conditioned VC-AP3D table with GT support.
+                # An asterisk marks AP from a bucket with fewer than 30 GT.
+                all_class_names = self._metadata.get("thing_classes") or []
+                min_reliable_gt = 30
+                class_lines = [
+                    "",
+                    "=" * 166,
+                    "CLASS-CONDITIONED VISIBILITY AP3D WITH GT COUNTS",
+                    "* marks a class/bucket with fewer than {} GT; interpret AP cautiously.".format(
+                        min_reliable_gt
+                    ),
+                    "=" * 166,
+                    "{:<22} {:>8} {:>10} {:>8} {:>10} {:>8} {:>10} {:>11} {:>11} {:>11}".format(
+                        "Category",
+                        "H-GT", "H-AP",
+                        "M-GT", "M-AP",
+                        "E-GT", "E-AP",
+                        "H-AP25", "M-AP25", "E-AP25",
+                    ),
+                    "-" * 166,
+                ]
+
+                for category_name in all_class_names:
+                    hard = visibility_class_results.get("hard", {}).get(category_name, {})
+                    medium = visibility_class_results.get("medium", {}).get(category_name, {})
+                    easy = visibility_class_results.get("easy", {}).get(category_name, {})
+
+                    hard_gt = int(hard.get("GT", 0))
+                    medium_gt = int(medium.get("GT", 0))
+                    easy_gt = int(easy.get("GT", 0))
+                    if hard_gt + medium_gt + easy_gt == 0:
+                        continue
+
+                    def cell(value, gt_count):
+                        rendered = _format_number(value)
+                        return rendered + ("*" if 0 < gt_count < min_reliable_gt else "")
+
+                    class_lines.append(
+                        "{:<22} {:>8d} {:>10} {:>8d} {:>10} {:>8d} {:>10} {:>11} {:>11} {:>11}".format(
+                            category_name,
+                            hard_gt,
+                            cell(hard.get("AP", float("nan")), hard_gt),
+                            medium_gt,
+                            cell(medium.get("AP", float("nan")), medium_gt),
+                            easy_gt,
+                            cell(easy.get("AP", float("nan")), easy_gt),
+                            cell(hard.get("AP25", float("nan")), hard_gt),
+                            cell(medium.get("AP25", float("nan")), medium_gt),
+                            cell(easy.get("AP25", float("nan")), easy_gt),
+                        )
+                    )
+                class_lines.append("=" * 166)
+                self._logger.info("\n".join(class_lines))
+
+                # Save machine-readable details next to the normal prediction file.
+                if self._output_dir:
+                    detail_path = os.path.join(
+                        self._output_dir,
+                        "visibility_conditioned_ap3d.json",
+                    )
+                    detail_payload = {
+                        "protocol": {
+                            "visibility": {
+                                key: list(value) for key, value in VISIBILITY_RANGES.items()
+                            },
+                            "depth": {
+                                "near": [0, 10],
+                                "medium": [10, 35],
+                                "far": [35, 100000],
+                            },
+                        },
+                        "gt_counts": visibility_counts,
+                        "class_gt_counts": visibility_class_counts,
+                        "visibility_status": (
+                            "available"
+                            if sum(visibility_counts.values()) > 0
+                            else "unavailable"
+                        ),
+                        "overall_by_visibility": {
+                            row["condition"].lower(): {
+                                "GT": row["gt"],
+                                "AP": row["AP"],
+                                "AP15": row["AP15"],
+                                "AP25": row["AP25"],
+                                "AP50": row["AP50"],
+                                "APn": self._results.get(
+                                    "bbox_3D_visibility_{}".format(
+                                        row["condition"].lower()
+                                    ), {}
+                                ).get("APn", float("nan")),
+                                "APm": self._results.get(
+                                    "bbox_3D_visibility_{}".format(
+                                        row["condition"].lower()
+                                    ), {}
+                                ).get("APm", float("nan")),
+                                "APf": self._results.get(
+                                    "bbox_3D_visibility_{}".format(
+                                        row["condition"].lower()
+                                    ), {}
+                                ).get("APf", float("nan")),
+                            }
+                            for row in visibility_summary_rows
+                        },
+                        "class_conditioned": visibility_class_results,
+                    }
+                    with PathManager.open(detail_path, "w") as detail_file:
+                        detail_file.write(json.dumps(detail_payload, indent=2, allow_nan=True))
+                        detail_file.flush()
+                    self._logger.info(
+                        "Saved visibility-conditioned metrics to %s", detail_path
+                    )
+
+
+
+def _extract_class_conditioned_ap3d(evaluator, class_names):
+    """Extract per-class AP3D and AP15/AP25/AP50 from one evaluator.
+
+    Precision shape is [IoU, recall, category, depth_range, max_dets].
+    Depth index 0 is the official all-depth range.
+    """
+    if evaluator is None or not evaluator.eval:
+        return OrderedDict()
+
+    precision = evaluator.eval.get("precision", None)
+    if precision is None:
+        return OrderedDict()
+
+    num_categories = precision.shape[2]
+    if class_names is None:
+        class_names = ["category_{}".format(i) for i in range(num_categories)]
+    if len(class_names) != num_categories:
+        logger.warning(
+            "Class-name count (%d) differs from evaluated category count (%d). "
+            "Falling back to category indices.",
+            len(class_names), num_categories,
+        )
+        class_names = ["category_{}".format(i) for i in range(num_categories)]
+
+    iou_targets = OrderedDict([
+        ("AP15", 0.15),
+        ("AP25", 0.25),
+        ("AP50", 0.50),
+    ])
+    results = OrderedDict()
+
+    for category_index, category_name in enumerate(class_names):
+        values = precision[:, :, category_index, 0, -1]
+        valid = values[values > -1]
+        row = {
+            "AP": float(np.mean(valid) * 100.0) if valid.size else float("nan")
+        }
+
+        for metric, threshold in iou_targets.items():
+            threshold_indices = np.where(
+                np.isclose(evaluator.params.iouThrs.astype(float), threshold)
+            )[0]
+            if threshold_indices.size == 0:
+                row[metric] = float("nan")
+                continue
+            threshold_values = precision[
+                threshold_indices, :, category_index, 0, -1
+            ]
+            threshold_valid = threshold_values[threshold_values > -1]
+            row[metric] = (
+                float(np.mean(threshold_valid) * 100.0)
+                if threshold_valid.size
+                else float("nan")
+            )
+
+        results[category_name] = row
+
+    return results
+
+
+def _format_number(value):
+    return "N/A" if value is None or not np.isfinite(value) else "{:.3f}".format(value)
+
+def _safe_visibility(value):
+    """Return a legal Omni3D visibility float in [0, 1], otherwise None."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value < 0.0 or value > 1.0:
+        return None
+    return value
+
+
+def _is_valid_visibility_3d_gt(annotation):
+    """Return True when GT geometry is usable for visibility-conditioned AP3D.
+
+    The original ignore3D flag is deliberately not used here because Omni3D
+    may set it for low-visibility objects. Reusing it would make the Hard
+    visibility bucket empty by construction.
+    """
+    if not bool(annotation.get("valid3D", False)):
+        return False
+    if bool(annotation.get("behind_camera", False)):
+        return False
+
+    center = annotation.get("center_cam", None)
+    if not isinstance(center, (list, tuple)) or len(center) < 3:
+        return False
+    try:
+        depth = float(center[2])
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(depth) or depth <= 0.0:
+        return False
+
+    # Reject malformed geometry if these fields are present.
+    dimensions = annotation.get("dimensions", None)
+    if isinstance(dimensions, (list, tuple)) and len(dimensions) >= 3:
+        try:
+            dims = np.asarray(dimensions[:3], dtype=np.float64)
+        except (TypeError, ValueError):
+            return False
+        if not np.all(np.isfinite(dims)) or np.any(dims <= 0.0):
+            return False
+
+    return True
+
+
+def _count_visibility_gt(omni_gt, visibility_range, img_ids=None):
+    """Count geometrically valid GT objects in one visibility bucket."""
+    if img_ids is None:
+        img_ids = omni_gt.getImgIds()
+    ann_ids = omni_gt.getAnnIds(imgIds=img_ids)
+    annotations = omni_gt.loadAnns(ann_ids)
+    lower, upper = visibility_range
+    count = 0
+    for ann in annotations:
+        visibility = _safe_visibility(ann.get("visibility", -1))
+        if visibility is None:
+            continue
+        if not _is_valid_visibility_3d_gt(ann):
+            continue
+        if lower <= visibility < upper:
+            count += 1
+    return count
+
+
+def _visibility_ignore_diagnostics(omni_gt, img_ids=None):
+    """Compare original ignore3D with visibility-aware geometric validity."""
+    if img_ids is None:
+        img_ids = omni_gt.getImgIds()
+    ann_ids = omni_gt.getAnnIds(imgIds=img_ids)
+    annotations = omni_gt.loadAnns(ann_ids)
+    diagnostics = OrderedDict()
+
+    for bucket, visibility_range in VISIBILITY_RANGES.items():
+        lower, upper = visibility_range
+        total = 0
+        original_ignored = 0
+        valid_for_occ_eval = 0
+        for ann in annotations:
+            visibility = _safe_visibility(ann.get("visibility", -1))
+            if visibility is None or not (lower <= visibility < upper):
+                continue
+            total += 1
+            if bool(ann.get("ignore3D", 0)):
+                original_ignored += 1
+            if _is_valid_visibility_3d_gt(ann):
+                valid_for_occ_eval += 1
+
+        diagnostics[bucket] = {
+            "total_visibility": total,
+            "original_ignore3D": original_ignored,
+            "valid_for_occ_eval": valid_for_occ_eval,
+        }
+
+    return diagnostics
+
+
+
+def _count_visibility_gt_per_class(
+    omni_gt,
+    visibility_range,
+    img_ids=None,
+    cat_ids=None,
+    class_names=None,
+):
+    """Count geometrically valid GT objects per class in one visibility bucket.
+
+    Counts use the same geometric validity and visibility rules as VC-AP3D.
+    The output keys follow evaluator category order, matching precision axis K.
+    """
+    if img_ids is None:
+        img_ids = omni_gt.getImgIds()
+    if cat_ids is None:
+        cat_ids = sorted(omni_gt.getCatIds())
+
+    if class_names is None or len(class_names) != len(cat_ids):
+        loaded_categories = omni_gt.loadCats(cat_ids)
+        class_names = [
+            category.get("name", "category_{}".format(category_id))
+            for category_id, category in zip(cat_ids, loaded_categories)
+        ]
+
+    category_id_to_name = {
+        int(category_id): class_name
+        for category_id, class_name in zip(cat_ids, class_names)
+    }
+    counts = OrderedDict((class_name, 0) for class_name in class_names)
+
+    ann_ids = omni_gt.getAnnIds(imgIds=img_ids, catIds=cat_ids)
+    annotations = omni_gt.loadAnns(ann_ids)
+    lower, upper = visibility_range
+
+    for annotation in annotations:
+        visibility = _safe_visibility(annotation.get("visibility", -1))
+        if visibility is None or not (lower <= visibility < upper):
+            continue
+        if not _is_valid_visibility_3d_gt(annotation):
+            continue
+
+        class_name = category_id_to_name.get(int(annotation.get("category_id", -1)))
+        if class_name is not None:
+            counts[class_name] += 1
+
+    return counts
+
+def _visibility_annotation_summary(omni_gt, img_ids=None):
+    """Summarize valid, missing, and out-of-range visibility annotations."""
+    if img_ids is None:
+        img_ids = omni_gt.getImgIds()
+    ann_ids = omni_gt.getAnnIds(imgIds=img_ids)
+    annotations = omni_gt.loadAnns(ann_ids)
+    valid = missing = outlier = 0
+    for ann in annotations:
+        raw = ann.get("visibility", -1)
+        if raw is None:
+            missing += 1
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            missing += 1
+            continue
+        if not np.isfinite(value):
+            missing += 1
+        elif value == -1:
+            missing += 1
+        elif 0.0 <= value <= 1.0:
+            valid += 1
+        else:
+            outlier += 1
+    return {
+        "total": len(annotations),
+        "valid": valid,
+        "missing": missing,
+        "outlier": outlier,
+    }
+
+
+def _evaluate_visibility_ap3d(
+    omni_gt,
+    omni_results,
+    iou_type="bbox",
+    img_ids=None,
+    eval_prox=False,
+):
+    """Evaluate AP3D for Hard, Medium, and Easy GT visibility buckets."""
+    evals = OrderedDict()
+    logs = OrderedDict()
+    counts = OrderedDict()
+    class_counts = OrderedDict()
+
+    summary = _visibility_annotation_summary(omni_gt, img_ids=img_ids)
+    logger.info(
+        "Visibility GT summary: valid=%d missing=%d outlier=%d total=%d",
+        summary["valid"], summary["missing"], summary["outlier"], summary["total"],
+    )
+
+    diagnostics = _visibility_ignore_diagnostics(omni_gt, img_ids=img_ids)
+    for bucket, values in diagnostics.items():
+        logger.info(
+            "Visibility diagnostic %s: total=%d original_ignore3D=%d "
+            "valid_for_occ_eval=%d",
+            bucket,
+            values["total_visibility"],
+            values["original_ignore3D"],
+            values["valid_for_occ_eval"],
+        )
+
+    if summary["valid"] == 0:
+        for bucket in VISIBILITY_RANGES:
+            evals[bucket] = None
+            logs[bucket] = "N/A: dataset has no legal visibility annotations"
+            counts[bucket] = 0
+            class_counts[bucket] = OrderedDict()
+        return evals, logs, counts, class_counts
+
+    omni_dt = omni_gt.loadRes(omni_results)
+
+    for bucket, visibility_range in VISIBILITY_RANGES.items():
+        gt_count = _count_visibility_gt(
+            omni_gt, visibility_range, img_ids=img_ids
+        )
+        counts[bucket] = gt_count
+        evaluator_cat_ids = sorted(omni_gt.getCatIds())
+        category_records = omni_gt.loadCats(evaluator_cat_ids)
+        evaluator_class_names = [
+            category.get("name", "category_{}".format(category_id))
+            for category_id, category in zip(evaluator_cat_ids, category_records)
+        ]
+        class_counts[bucket] = _count_visibility_gt_per_class(
+            omni_gt,
+            visibility_range,
+            img_ids=img_ids,
+            cat_ids=evaluator_cat_ids,
+            class_names=evaluator_class_names,
+        )
+
+        if gt_count == 0:
+            evals[bucket] = None
+            logs[bucket] = "N/A: no GT in visibility bucket {}".format(bucket)
+            continue
+
+        evaluator = Omni3Deval(
+            omni_gt, omni_dt, iouType=iou_type, mode="3D", eval_prox=eval_prox
+        )
+        evaluator.params.useVisibility = True
+        evaluator.params.visibilityRng = list(visibility_range)
+        evaluator.params.visibilityRngLbl = bucket
+        if img_ids is not None:
+            evaluator.params.imgIds = img_ids
+
+        logger.info(
+            "Running visibility AP3D: %s range=[%.2f, %.2f), GT=%d",
+            bucket, visibility_range[0], visibility_range[1], gt_count,
+        )
+        evaluator.evaluate()
+        evaluator.accumulate()
+        logs[bucket] = evaluator.summarize()
+        evals[bucket] = evaluator
+
+    return evals, logs, counts, class_counts
 
 
 def _evaluate_predictions_on_omni(
@@ -1084,6 +1694,12 @@ class Omni3DParams:
         # the proximity threshold defines the neighborhood
         # when evaluating on non-exhaustively annotated datasets
         self.proximity_thresh = 0.3
+
+        # Visibility filtering is opt-in so the original Omni3D metrics remain
+        # unchanged. The selected bucket uses a half-open [low, high) range.
+        self.useVisibility = False
+        self.visibilityRng = [0.0, 1.0 + 1e-10]
+        self.visibilityRngLbl = "all"
 
 
 # ---------------------------------------------------------------------
@@ -1451,12 +2067,44 @@ class Omni3Deval(COCOeval):
 
         flag_range = "area" if self.mode == "2D" else "depth"
         flag_ignore = "ignore2D" if self.mode == "2D" else "ignore3D"
-
         for g in gt:
-            if g[flag_ignore] or (g[flag_range] < aRng[0] or g[flag_range] > aRng[1]):
-                g["_ignore"] = 1
+            visibility_mode = self.mode == "3D" and p.useVisibility
+
+            if visibility_mode:
+                # Do not inherit ignore3D here. In Omni3D that flag can encode
+                # low visibility, which would remove the entire Hard bucket.
+                # Instead, reconstruct reliability from explicit geometry.
+                should_ignore = not _is_valid_visibility_3d_gt(g)
             else:
-                g["_ignore"] = 0
+                # Keep the official evaluator unchanged outside the new metric.
+                should_ignore = bool(g.get(flag_ignore, 0))
+
+            # Preserve the official area/depth range filtering.
+            range_value = g.get(flag_range, None)
+            try:
+                range_value = float(range_value)
+            except (TypeError, ValueError):
+                range_value = np.nan
+            if (
+                not np.isfinite(range_value)
+                or range_value < aRng[0]
+                or range_value > aRng[1]
+            ):
+                should_ignore = True
+
+            # GT outside the selected bucket, missing visibility, and outliers
+            # stay in matching as ignored GT. Matching detections are therefore
+            # ignored rather than incorrectly counted as false positives.
+            if visibility_mode:
+                visibility = _safe_visibility(g.get("visibility", -1))
+                in_bucket = (
+                    visibility is not None
+                    and p.visibilityRng[0] <= visibility < p.visibilityRng[1]
+                )
+                if not in_bucket:
+                    should_ignore = True
+
+            g["_ignore"] = int(should_ignore)
 
         # sort dt highest score first, sort gt ignore last
         gtind = np.argsort([g["_ignore"] for g in gt], kind="mergesort")
