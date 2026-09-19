@@ -1,5 +1,7 @@
+from typing import Dict, Optional, Sequence
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -142,3 +144,405 @@ def bbox_loss(
         loss = loss.mean() if loss.numel() > 0 else 0.0 * loss.sum()
 
     return loss
+
+class TSREvidenceLoss(nn.Module):
+    """
+    Optional regularization loss for TSR evidence maps.
+
+    This is NOT the main supervision for TSR.
+
+    Main supervision:
+        depth loss -> depth evidence route
+        dim loss   -> dim evidence route
+        pose loss  -> pose evidence route
+
+    This loss only prevents undesirable map degeneration.
+
+    ROI input format:
+        evidence_maps: [B, T, 1, H, W]
+
+    Dense input format:
+        evidence_maps: [B, T, 1, H, W]
+
+    ROI mode:
+        Evidence maps are spatial-softmax distributions.
+        Diversity and minimum-entropy regularization are supported.
+
+    Dense mode:
+        Maps are independent sigmoid gates.
+        Spatial-softmax entropy assumptions do not apply.
+        Regularization is disabled by default.
+    """
+
+    def __init__(
+        self,
+        similarity_margin: float = 0.95,
+        min_normalized_entropy: float = 0.20,
+        diversity_weight: float = 1.0,
+        entropy_weight: float = 0.0,
+        dense_balance_weight: float = 0.0,
+        dense_target_mean: float = 0.80,
+        dense_total_variation_weight: float = 0.0,
+        eps: float = 1e-8,
+    ) -> None:
+        super().__init__()
+
+        if not 0.0 <= similarity_margin <= 1.0:
+            raise ValueError(
+                "similarity_margin must be between 0 and 1."
+            )
+
+        if not 0.0 <= min_normalized_entropy <= 1.0:
+            raise ValueError(
+                "min_normalized_entropy must be between 0 and 1."
+            )
+
+        if not 0.0 <= dense_target_mean <= 1.0:
+            raise ValueError(
+                "dense_target_mean must be between 0 and 1."
+            )
+
+        if diversity_weight < 0.0:
+            raise ValueError("diversity_weight cannot be negative.")
+
+        if entropy_weight < 0.0:
+            raise ValueError("entropy_weight cannot be negative.")
+
+        if dense_balance_weight < 0.0:
+            raise ValueError(
+                "dense_balance_weight cannot be negative."
+            )
+
+        if dense_total_variation_weight < 0.0:
+            raise ValueError(
+                "dense_total_variation_weight cannot be negative."
+            )
+
+        self.similarity_margin = float(similarity_margin)
+        self.min_normalized_entropy = float(
+            min_normalized_entropy
+        )
+
+        self.diversity_weight = float(diversity_weight)
+        self.entropy_weight = float(entropy_weight)
+
+        self.dense_balance_weight = float(
+            dense_balance_weight
+        )
+        self.dense_target_mean = float(dense_target_mean)
+
+        self.dense_total_variation_weight = float(
+            dense_total_variation_weight
+        )
+
+        self.eps = float(eps)
+
+    def _validate_maps(
+        self,
+        evidence_maps: torch.Tensor,
+    ) -> None:
+        if not isinstance(evidence_maps, torch.Tensor):
+            raise TypeError(
+                "evidence_maps must be a torch.Tensor."
+            )
+
+        if evidence_maps.ndim != 5:
+            raise ValueError(
+                "Expected evidence_maps with shape "
+                "[B, T, 1, H, W], but received "
+                f"{tuple(evidence_maps.shape)}."
+            )
+
+        if evidence_maps.shape[2] != 1:
+            raise ValueError(
+                "The channel dimension of each evidence map "
+                "must equal 1."
+            )
+
+        if evidence_maps.shape[-2] <= 0:
+            raise ValueError("H must be positive.")
+
+        if evidence_maps.shape[-1] <= 0:
+            raise ValueError("W must be positive.")
+
+        if not torch.isfinite(evidence_maps).all():
+            raise ValueError(
+                "evidence_maps contains NaN or Inf."
+            )
+
+    def _roi_diversity_loss(
+        self,
+        probabilities: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            probabilities: [B, T, HW]
+
+        Returns:
+            loss_diversity
+            mean_off_diagonal_similarity
+        """
+        batch_size, num_tasks, _ = probabilities.shape
+
+        if num_tasks <= 1:
+            zero = probabilities.sum() * 0.0
+            return zero, zero.detach()
+
+        normalized_maps = F.normalize(
+            probabilities,
+            p=2,
+            dim=-1,
+            eps=self.eps,
+        )
+
+        similarity = torch.bmm(
+            normalized_maps,
+            normalized_maps.transpose(1, 2),
+        )
+
+        # Only select the upper triangular entries.
+        # This avoids counting both (depth, dim) and (dim, depth).
+        upper_mask = torch.triu(
+            torch.ones(
+                num_tasks,
+                num_tasks,
+                dtype=torch.bool,
+                device=similarity.device,
+            ),
+            diagonal=1,
+        )
+
+        off_diagonal_similarity = similarity[:, upper_mask]
+
+        loss_diversity = F.relu(
+            off_diagonal_similarity
+            - self.similarity_margin
+        ).mean()
+
+        mean_similarity = (
+            off_diagonal_similarity.mean().detach()
+        )
+
+        return loss_diversity, mean_similarity
+
+    def _roi_entropy_loss(
+        self,
+        probabilities: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Minimum normalized entropy constraint.
+
+        This does not maximize entropy indefinitely.
+
+        It only penalizes evidence maps whose normalized entropy
+        drops below min_normalized_entropy.
+
+        Args:
+            probabilities: [B, T, HW]
+
+        Returns:
+            loss_entropy
+            mean_normalized_entropy
+        """
+        num_positions = probabilities.shape[-1]
+
+        entropy = -(
+            probabilities
+            * torch.log(probabilities.clamp_min(self.eps))
+        ).sum(dim=-1)
+
+        if num_positions <= 1:
+            normalized_entropy = torch.ones_like(entropy)
+        else:
+            max_entropy = torch.log(
+                probabilities.new_tensor(
+                    float(num_positions)
+                )
+            ).clamp_min(self.eps)
+
+            normalized_entropy = entropy / max_entropy
+
+        loss_entropy = F.relu(
+            self.min_normalized_entropy
+            - normalized_entropy
+        ).mean()
+
+        mean_normalized_entropy = (
+            normalized_entropy.mean().detach()
+        )
+
+        return (
+            loss_entropy,
+            mean_normalized_entropy,
+        )
+
+    def _forward_roi(
+        self,
+        evidence_maps: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, num_tasks, _, height, width = (
+            evidence_maps.shape
+        )
+
+        flat_maps = evidence_maps.reshape(
+            batch_size,
+            num_tasks,
+            height * width,
+        )
+
+        # TSR ROI maps already come from spatial softmax.
+        # Renormalization is kept for numerical safety.
+        probabilities = flat_maps.clamp_min(self.eps)
+
+        probabilities = probabilities / (
+            probabilities.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(self.eps)
+        )
+
+        loss_diversity, mean_similarity = (
+            self._roi_diversity_loss(probabilities)
+        )
+
+        loss_entropy, mean_entropy = (
+            self._roi_entropy_loss(probabilities)
+        )
+
+        total_loss = (
+            self.diversity_weight * loss_diversity
+            + self.entropy_weight * loss_entropy
+        )
+
+        return {
+            # Only this tensor should be added to training loss.
+            "loss_tsr_regularizer": total_loss,
+
+            # The following are detached monitoring values.
+            "loss_tsr_diversity": (
+                loss_diversity.detach()
+            ),
+            "loss_tsr_entropy": (
+                loss_entropy.detach()
+            ),
+            "tsr_map_similarity": mean_similarity,
+            "tsr_normalized_entropy": mean_entropy,
+            "tsr_map_max": (
+                probabilities.max(dim=-1).values
+                .mean()
+                .detach()
+            ),
+            "tsr_map_min": (
+                probabilities.min(dim=-1).values
+                .mean()
+                .detach()
+            ),
+        }
+
+    def _dense_total_variation(
+        self,
+        gates: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Optional spatial smoothness regularizer for dense sigmoid gates.
+
+        gates: [B, T, 1, H, W]
+        """
+        height = gates.shape[-2]
+        width = gates.shape[-1]
+
+        zero = gates.sum() * 0.0
+
+        if height > 1:
+            variation_y = (
+                gates[..., 1:, :]
+                - gates[..., :-1, :]
+            ).abs().mean()
+        else:
+            variation_y = zero
+
+        if width > 1:
+            variation_x = (
+                gates[..., :, 1:]
+                - gates[..., :, :-1]
+            ).abs().mean()
+        else:
+            variation_x = zero
+
+        return variation_x + variation_y
+
+    def _forward_dense(
+        self,
+        evidence_maps: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Dense mode maps are sigmoid gates, not spatial distributions.
+
+        Therefore:
+        - no spatial entropy loss
+        - no forced task orthogonality by default
+
+        Optional constraints:
+        - gate mean warm-start regularization
+        - total variation
+        """
+        gate_mean_per_task = evidence_maps.mean(
+            dim=(0, 2, 3, 4)
+        )
+
+        target = torch.full_like(
+            gate_mean_per_task,
+            self.dense_target_mean,
+        )
+
+        loss_balance = F.smooth_l1_loss(
+            gate_mean_per_task,
+            target,
+        )
+
+        loss_total_variation = (
+            self._dense_total_variation(evidence_maps)
+        )
+
+        total_loss = (
+            self.dense_balance_weight * loss_balance
+            + self.dense_total_variation_weight
+            * loss_total_variation
+        )
+
+        return {
+            "loss_tsr_regularizer": total_loss,
+            "loss_tsr_dense_balance": (
+                loss_balance.detach()
+            ),
+            "loss_tsr_dense_tv": (
+                loss_total_variation.detach()
+            ),
+            "tsr_dense_gate_mean": (
+                gate_mean_per_task.mean().detach()
+            ),
+            "tsr_dense_gate_min": (
+                evidence_maps.min().detach()
+            ),
+            "tsr_dense_gate_max": (
+                evidence_maps.max().detach()
+            ),
+        }
+
+    def forward(
+        self,
+        evidence_maps: torch.Tensor,
+        mode: str = "roi",
+    ) -> Dict[str, torch.Tensor]:
+        self._validate_maps(evidence_maps)
+
+        if mode == "roi":
+            return self._forward_roi(evidence_maps)
+
+        if mode == "dense":
+            return self._forward_dense(evidence_maps)
+
+        raise ValueError(
+            f"Unsupported mode={mode!r}. "
+            "Expected 'roi' or 'dense'."
+        )
