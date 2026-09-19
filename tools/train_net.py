@@ -28,7 +28,7 @@ sys.dont_write_bytecode = True
 sys.path.append(os.getcwd())
 np.set_printoptions(suppress=True)
 
-from cubercnn.solver import build_optimizer, freeze_bn, PeriodicCheckpointerOnlyOne
+from cubercnn.solver import build_optimizer, freeze_bn, build_optimizer_yolo3d, PeriodicCheckpointerOnlyOne
 from cubercnn.config import get_cfg_defaults
 from cubercnn.data import (
     load_omni3d_json,
@@ -45,12 +45,63 @@ from cubercnn.evaluation import (
 )
 from cubercnn.modeling.proposal_generator import RPNWithIgnore
 from cubercnn.modeling.roi_heads import ROIHeads3D
-from cubercnn.modeling.meta_arch import RCNN3D, build_model
+from cubercnn.modeling.meta_arch import RCNN3D, YOLO3DWrapper, build_model, build_yolo_wrapper
 from cubercnn.modeling.backbone import build_dla_from_vision_fpn_backbone
 from cubercnn import util, vis, data
 import cubercnn.vis.logperf as utils_logperf
 
 MAX_TRAINING_ATTEMPTS = 10
+
+
+def _get_criterion(model):
+    """
+    解開 DDP 包裝並取得 criterion，支援以下幾種掛載位置：
+    1. model.criterion
+    2. model.module.criterion (DDP)
+    3. model.model.criterion / model.module.model.criterion (Wrapper 內層)
+    """
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "criterion"):
+        return raw_model.criterion
+    if hasattr(raw_model, "model") and hasattr(raw_model.model, "criterion"):
+        return raw_model.model.criterion
+    return None
+
+
+def _update_criterion(criterion, epoch: int, max_epoch: float = None):
+    """
+    動態調用 criterion.update，自適應各種可能的函式簽名定義。
+    """
+    if criterion is None or not hasattr(criterion, "update"):
+        return
+
+    # 1. 嘗試 update(epoch=..., max_epoch=...)
+    try:
+        criterion.update(epoch=epoch, max_epoch=max_epoch)
+        return
+    except TypeError:
+        pass
+
+    # 2. 嘗試 update(epoch=...)
+    try:
+        criterion.update(epoch=epoch)
+        return
+    except TypeError:
+        pass
+
+    # 3. 嘗試 update(epoch)
+    try:
+        criterion.update(epoch)
+        return
+    except TypeError:
+        pass
+
+    # 4. 嘗試 update()
+    try:
+        criterion.update()
+        return
+    except TypeError:
+        pass
 
 
 def do_test(cfg, model, iteration='final', storage=None):
@@ -119,9 +170,18 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=F
     max_iter = cfg.SOLVER.MAX_ITER
     do_eval = cfg.TEST.EVAL_PERIOD > 0
 
+    # 計算單個 epoch 的 iteration 數及總 epoch 數
+    total_images = sum(len(DatasetCatalog.get(name)) for name in cfg.DATASETS.TRAIN) if cfg.DATASETS.TRAIN else 1
+    iters_per_epoch = max(total_images // cfg.SOLVER.IMS_PER_BATCH, 1)
+    total_epochs = getattr(cfg.MODEL.YOLO3D, "EPOCHS", max_iter / iters_per_epoch)
+
     model.train()
 
-    optimizer = build_optimizer(cfg, model)
+    # optimizer = build_optimizer(cfg, model)
+    optimizer = (
+        build_optimizer_yolo3d(cfg, model) if cfg.MODEL.META_ARCHITECTURE == "YOLO3DWrapper"
+        else build_optimizer(cfg, model)
+    )
     scheduler = build_lr_scheduler(cfg, optimizer)
 
     # bookkeeping
@@ -146,6 +206,14 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=F
     iteration = start_iter
 
     logger.info("Starting training from iteration {}".format(start_iter))
+
+    # 若為 resume 且已進行若干進度，對齊 criterion 當前的 epoch 狀態
+    if start_iter > 0:
+        initial_epoch = start_iter // iters_per_epoch
+        criterion = _get_criterion(model)
+        _update_criterion(criterion, epoch=initial_epoch, max_epoch=total_epochs)
+        if comm.is_main_process():
+            logger.info(f"[Resume] Synchronized criterion to epoch {initial_epoch} (iter {start_iter})")
 
     if not cfg.MODEL.USE_BN:
         freeze_bn(model)
@@ -286,6 +354,14 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=F
                 
             scheduler.step()
 
+            # 依據 Epoch 更新 Criterion
+            if (iteration + 1) % iters_per_epoch == 0:
+                current_epoch = (iteration + 1) // iters_per_epoch
+                criterion = _get_criterion(model)
+                _update_criterion(criterion, epoch=current_epoch, max_epoch=total_epochs)
+                if comm.is_main_process():
+                    logger.info(f"[Epoch Update] Criterion updated at epoch {current_epoch} (iter {iteration + 1})")
+
             # Evaluate only when the loss is not diverging.
             if not (diverging_model > 0) and \
                 (do_eval and ((iteration + 1) % cfg.TEST.EVAL_PERIOD) == 0 and iteration != (max_iter - 1)):
@@ -314,6 +390,29 @@ def do_train(cfg, model, dataset_id_to_unknown_cats, dataset_id_to_src, resume=F
     
     # success
     return True
+
+
+def resolve_epoch_iter_config(cfg, mode: str = "iter") -> int:
+    total_images = sum(len(DatasetCatalog.get(name)) for name in cfg.DATASETS.TRAIN)
+    iters_per_epoch = max(total_images // cfg.SOLVER.IMS_PER_BATCH, 1)
+
+    if mode == "epoch":
+        if cfg.MODEL.YOLO3D.EPOCHS <= 0:
+            raise ValueError("mode='epoch' 需要先設定 cfg.MODEL.YOLO3D.EPOCHS > 0")
+        cfg.SOLVER.MAX_ITER = int(round(cfg.MODEL.YOLO3D.EPOCHS * iters_per_epoch))
+    elif mode == "iter":
+        if cfg.SOLVER.MAX_ITER <= 0:
+            raise ValueError("mode='iter' 需要先設定 cfg.SOLVER.MAX_ITER > 0")
+        cfg.MODEL.YOLO3D.EPOCHS = cfg.SOLVER.MAX_ITER / iters_per_epoch
+    else:
+        raise ValueError(f"cfg.MODEL.YOLO3D.TIME_UNIT 必須是 'epoch' 或 'iter'，收到 {mode!r}")
+
+    logger.info(
+        f"[epoch/iter 換算] 資料集共 {total_images} 張，iters_per_epoch={iters_per_epoch}，"
+        f"MAX_ITER={cfg.SOLVER.MAX_ITER}，YOLO epochs={cfg.MODEL.YOLO3D.EPOCHS:.2f}（mode={mode}）"
+    )
+    return iters_per_epoch
+
 
 def setup(args):
     """
@@ -345,7 +444,7 @@ def setup(args):
     for dataset_name in dataset_names_test:
         if not(dataset_name in cfg.DATASETS.TRAIN):
             simple_register(dataset_name, filter_settings, filter_empty=False)
-    
+
     return cfg
 
 
@@ -360,8 +459,6 @@ def main(args):
     priors = None
 
     if args.eval_only:
-        # category_path = os.path.join(util.file_parts(args.config_file)[0], 'category_meta.json')
-        
         weight_dir = os.path.dirname(cfg.MODEL.WEIGHTS)
         category_path = os.path.join(weight_dir, 'category_meta.json')
         
@@ -425,6 +522,11 @@ def main(args):
 
         # compute priors given the training data.
         priors = util.compute_priors(cfg, datasets)
+
+    if not args.eval_only and cfg.MODEL.META_ARCHITECTURE == "YOLO3DWrapper" and cfg.DATASETS.TRAIN:
+        cfg.defrost()
+        resolve_epoch_iter_config(cfg, mode=cfg.MODEL.YOLO3D.TIME_UNIT)
+        cfg.freeze()
     
     '''
     The training loops can attempt to train for N times.
@@ -435,7 +537,10 @@ def main(args):
     while remaining_attempts > 0:
 
         # build the training model.
-        model = build_model(cfg, priors=priors)
+        if cfg.MODEL.META_ARCHITECTURE == "YOLO3DWrapper":
+            model = build_yolo_wrapper(cfg)
+        else:
+            model = build_model(cfg, priors=priors) 
 
         if remaining_attempts == MAX_TRAINING_ATTEMPTS:
             # log the first attempt's settings.
@@ -471,6 +576,7 @@ def main(args):
         
     return do_test(cfg, model)
 
+
 def allreduce_dict(input_dict, average=True):
     """
     Reduce the values in the dictionary from all processes so that process with rank
@@ -499,6 +605,7 @@ def allreduce_dict(input_dict, average=True):
             values /= world_size
         reduced_dict = {k: v for k, v in zip(names, values)}
     return reduced_dict
+
 
 if __name__ == "__main__":
     args = default_argument_parser().parse_args()

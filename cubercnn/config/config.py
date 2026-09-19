@@ -90,7 +90,7 @@ def get_cfg_defaults(cfg):
     # -------------------------------------------------------------------------
     # Single-Stage Dense Cube Head Options (DenseCubeHead + SimOTAAssigner)
     # -------------------------------------------------------------------------
-    cfg.MODEL.BACKBONE.SIZE = 's'
+    cfg.MODEL.BACKBONE.SIZE = 'n'
     cfg.MODEL.DENSE_HEAD = CN()
     cfg.MODEL.DENSE_HEAD.NAME = "DenseCubeHead"
     cfg.MODEL.DENSE_HEAD.IN_FEATURES = ['p2', 'p3', 'p4', 'p5', 'p6']
@@ -152,3 +152,21 @@ def get_cfg_defaults(cfg):
     cfg.TEST.VISIBILITY_THRES = 0.5
     cfg.TEST.TRUNCATION_THRES = 0.5
     cfg.INPUT.RANDOM_FLIP = "horizontal"
+
+
+    cfg.MODEL.YOLO = CN()
+    cfg.MODEL.YOLO.WEIGHTS = "yolo11s.pt"
+    cfg.MODEL.YOLO.NORM = "BN"
+    cfg.MODEL.YOLO.OUT_CHANNELS = 256
+    cfg.MODEL.YOLO.OUT_FEATURES = ['p3', 'p4', 'p5']
+    cfg.MODEL.YOLO.FREEZE_BACKBONE = False
+
+
+    cfg.MODEL.INPUT_FORMAT = "BGR"
+    cfg.MODEL.YOLO3D = CN()
+    cfg.MODEL.YOLO3D.ARCH = "configs/YOLO3D.yaml"
+    cfg.MODEL.YOLO3D.IS_E2E = True
+    cfg.MODEL.YOLO3D.TIME_UNIT = "iter"
+    cfg.MODEL.YOLO3D.EPOCHS = 0.0
+    cfg.MODEL.PRETRAINED_WEIGHTS = ""
+    cfg.SOLVER.WEIGHT_DECAY = 0.005

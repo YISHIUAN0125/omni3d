@@ -1,9 +1,9 @@
-# _BASE_: "Base_Single_Stage.yaml"
-_BASE_: "Base_Cascade_Single_Stage.yaml"
+_BASE_: "Base_Single_Stage.yaml"
+# _BASE_: "Base_Cascade_Single_Stage.yaml"
 SOLVER:
   TYPE: "sgd"
-  IMS_PER_BATCH: 8
-  BASE_LR: 0.005 
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.01 
   STEPS: (54000, 72000)
   MAX_ITER: 90000     
   WARMUP_ITERS: 1000

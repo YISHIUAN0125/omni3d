@@ -1,0 +1,27 @@
+_BASE_: Base.yaml
+SOLVER:
+  TYPE: "sgd"
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.01 
+  MAX_ITER: 928000  # 8 * 116000
+  STEPS: (556800, 742400) # 60%, 80%
+  WARMUP_ITERS: 29000 # 3625 / 116000 * 928000
+TEST:
+  EVAL_PERIOD: 9280
+VIS_PERIOD: 1000
+DATALOADER:
+  NUM_WORKERS: 2
+DATASETS:
+  TRAIN: ('SUNRGBD_train', 'SUNRGBD_val', 'Hypersim_train', 'Hypersim_val', 'ARKitScenes_train', 'ARKitScenes_val')
+  TEST: ('SUNRGBD_test', 'Hypersim_test', 'ARKitScenes_test') 
+  CATEGORY_NAMES: ('stationery', 'sink', 'table', 'floor mat', 'bottle', 'bookcase', 'bin', 'blinds', 'pillow', 'bicycle', 'refrigerator', 'night stand', 'chair', 'sofa', 'books', 'oven', 'towel', 'cabinet', 'window', 'curtain', 'bathtub', 'laptop', 'desk', 'television', 'clothes', 'stove', 'cup', 'shelves', 'box', 'shoes', 'mirror', 'door', 'picture', 'lamp', 'machine', 'counter', 'bed', 'toilet')
+MODEL:
+  FPN:
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
+  ANCHOR_GENERATOR:
+    SIZES: [[64], [128], [256], [512]]  # One size for each in feature map
+    ASPECT_RATIOS: [[0.5, 1.0, 2.0]]  # Three aspect ratios (same for all in feature maps)
+  RPN:
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']
+  ROI_HEADS:
+    IN_FEATURES: ['p3', 'p4', 'p5', 'p6']

@@ -1,0 +1,41 @@
+SOLVER:
+  TYPE: "adamw"
+  IMS_PER_BATCH: 16
+  BASE_LR: 0.01
+  WEIGHT_DECAY: 0.005 
+  STEPS: (54000, 72000)
+  MAX_ITER: 90000     
+  WARMUP_ITERS: 1000
+TEST:
+  EVAL_PERIOD: 6000
+  VISIBILITY_THRES: 0.33333333
+  TRUNCATION_THRES: 0.33333333
+VIS_PERIOD: 1000
+DATASETS:
+  TRAIN: ('SUNRGBD_train', 'SUNRGBD_val', 'Hypersim_train', 'Hypersim_val', 'ARKitScenes_train', 'ARKitScenes_val')
+  TEST: ('SUNRGBD_test', 'Hypersim_test', 'ARKitScenes_test') 
+  CATEGORY_NAMES: ('stationery', 'sink', 'table', 'floor mat', 'bottle', 'bookcase', 'bin', 'blinds', 'pillow', 'bicycle', 'refrigerator', 'night stand', 'chair', 'sofa', 'books', 'oven', 'towel', 'cabinet', 'window', 'curtain', 'bathtub', 'laptop', 'desk', 'television', 'clothes', 'stove', 'cup', 'shelves', 'box', 'shoes', 'mirror', 'door', 'picture', 'lamp', 'machine', 'counter', 'bed', 'toilet')
+  IGNORE_NAMES: "['dontcare', 'ignore', 'void']"
+  MIN_HEIGHT_THRES: 0.05
+  TRUNCATION_THRES: 0.75
+  VISIBILITY_THRES: 0.25
+  TRUNC_2D_BOXES: True
+INPUT:
+  MIN_SIZE_TRAIN: (256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640)
+  MIN_SIZE_TEST: 512
+  MAX_SIZE_TRAIN: 4096
+  MAX_SIZE_TEST: 4096
+DATALOADER:
+  SAMPLER_TRAIN: "RepeatFactorTrainingSampler"
+  REPEAT_THRESHOLD: 0.1
+MODEL:
+  INPUT_FORMAT: "BGR"
+  PIXEL_MEAN: [0.0, 0.0, 0.0]
+  PIXEL_STD: [255.0, 255.0, 255.0]
+  META_ARCHITECTURE: "YOLO3DWrapper"
+  YOLO3D:
+    ARCH: "configs/YOLO3D.yaml"
+    IS_E2E: true
+    TIME_UNIT: "iter"
+
+

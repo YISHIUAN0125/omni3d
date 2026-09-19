@@ -171,6 +171,7 @@ class TaskAlignedAssigner:
         self.topk = getattr(cfg.MODEL.DENSE_HEAD, "TAL_TOPK", 13)
         self.alpha = getattr(cfg.MODEL.DENSE_HEAD, "TAL_ALPHA", 1.0)
         self.beta = getattr(cfg.MODEL.DENSE_HEAD, "TAL_BETA", 6.0)
+        self.center_radius = cfg.MODEL.DENSE_HEAD.CENTER_RADIUS
         self.eps = 1e-9
 
     @torch.no_grad()
@@ -197,8 +198,9 @@ class TaskAlignedAssigner:
             self._apply_ignore(assigned_labels, points, gt_boxes_ign_i)
             return assigned_labels, assigned_gt_inds, target_scores
 
-        is_in_gts = self._get_geometry_constraint(points, gt_boxes_i)
-        candidate_mask = is_in_gts.any(dim=1)
+        is_in_gts, is_in_centers = self._get_geometry_constraint(points, strides, gt_boxes_i)
+        is_in_boxes_and_centers = is_in_gts & is_in_centers # TODO Use & or |
+        candidate_mask = is_in_boxes_and_centers.any(dim=1)
 
         if candidate_mask.sum() == 0:
             self._apply_ignore(assigned_labels, points, gt_boxes_ign_i)
@@ -210,7 +212,7 @@ class TaskAlignedAssigner:
         is_in_gts_c = is_in_gts[cand_idx]
 
         # pair_iou = retry_if_cuda_oom(pairwise_iou)(Boxes(box_preds_c), Boxes(gt_boxes_i)).clamp_(0)
-        pair_iou = retry_if_cuda_oom(pairwise_bbox_iou)(box_preds_c, gt_boxes_i, mode="ciou").clamp_(0)
+        pair_iou = retry_if_cuda_oom(pairwise_bbox_iou)(box_preds_c, gt_boxes_i, mode="ciou").clamp(0)
 
         bbox_scores = cls_preds_c[:, gt_labels_i] 
         if obj_preds_i is not None:
@@ -229,22 +231,20 @@ class TaskAlignedAssigner:
             valid_cand_idxs = topk_idxs[:, gt_idx][valid_mask[:, gt_idx]]
             matching_matrix[valid_cand_idxs, gt_idx] = 1
 
-        fg_mask_c = matching_matrix.sum(1) > 0
-        if matching_matrix.sum(1).max() > 1:
-            _, max_gt_idx = align_metric.max(dim=1) 
-            matching_matrix.zero_()
-            matching_matrix[fg_mask_c, max_gt_idx[fg_mask_c]] = 1
+        multi_match = matching_matrix.sum(1) > 1
+        if multi_match.any():
+            multi_match_idx = multi_match.nonzero(as_tuple=True)[0]
+            masked_align = align_metric[multi_match_idx] * matching_matrix[multi_match_idx]
+            best_gt_idx = masked_align.argmax(dim=1)
+            matching_matrix[multi_match_idx] = 0
+            matching_matrix[multi_match_idx, best_gt_idx] = 1
 
-        # -------------------------------------------------------------
-        # 產生正規化的 Target Score (Soft Label)
-        # -------------------------------------------------------------
         align_metric *= matching_matrix
         pos_align_metrics = align_metric.max(dim=0, keepdim=True)[0]
         overlaps = pair_iou * matching_matrix
         pos_overlaps = overlaps.max(dim=0, keepdim=True)[0]
 
-        # norm_align_metric = align_metric * pos_overlaps / (pos_align_metrics + self.eps)
-        norm_align_metric = align_metric * pos_overlaps.clamp(min=0.5) / (pos_align_metrics + self.eps)
+        norm_align_metric = align_metric * pos_overlaps / (pos_align_metrics + self.eps)
         cand_scores = norm_align_metric.max(dim=1)[0] # (P_cand,)
 
         matched_gt_inds_c = matching_matrix.argmax(1) 
@@ -262,16 +262,25 @@ class TaskAlignedAssigner:
 
         return assigned_labels, assigned_gt_inds, target_scores
 
-    def _get_geometry_constraint(self, points, gt_boxes_i):
-        x, y = points[:, 0].unsqueeze(1), points[:, 1].unsqueeze(1) 
+    def _get_geometry_constraint(self, points, strides, gt_boxes_i):
+        x, y = points[:, 0].unsqueeze(1), points[:, 1].unsqueeze(1) # (P, 1)
 
         l = x - gt_boxes_i[:, 0].unsqueeze(0)
         t = y - gt_boxes_i[:, 1].unsqueeze(0)
         r = gt_boxes_i[:, 2].unsqueeze(0) - x
         b = gt_boxes_i[:, 3].unsqueeze(0) - y
-        
-        is_in_boxes = torch.stack([l, t, r, b], dim=-1).min(-1)[0] > 0 
-        return is_in_boxes
+        is_in_boxes = torch.stack([l, t, r, b], dim=-1).min(-1)[0] > 0 # (P, G)
+
+        gt_cx = (gt_boxes_i[:, 0] + gt_boxes_i[:, 2]) * 0.5
+        gt_cy = (gt_boxes_i[:, 1] + gt_boxes_i[:, 3]) * 0.5
+        radius = strides.unsqueeze(1) * self.center_radius
+        cl = x - (gt_cx.unsqueeze(0) - radius)
+        ct = y - (gt_cy.unsqueeze(0) - radius)
+        cr = (gt_cx.unsqueeze(0) + radius) - x
+        cb = (gt_cy.unsqueeze(0) + radius) - y
+        is_in_centers = torch.stack([cl, ct, cr, cb], dim=-1).min(-1)[0] > 0 # (P, G)
+
+        return is_in_boxes, is_in_centers
 
     def _apply_ignore(self, assigned_labels, points, gt_boxes_ign_i):
         if gt_boxes_ign_i is None or gt_boxes_ign_i.shape[0] == 0:

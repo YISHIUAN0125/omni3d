@@ -14,3 +14,7 @@ cubercnn/external/
 *~
 *.so
 *.ipynb
+
+# yolo weights
+*.pt
+pretrained/
