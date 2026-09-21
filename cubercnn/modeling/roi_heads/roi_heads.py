@@ -19,6 +19,7 @@ from detectron2.modeling.roi_heads import (
 )
 from detectron2.modeling.poolers import ROIPooler
 from cubercnn.modeling.roi_heads.cube_head import build_cube_head
+from cubercnn.modeling.roi_heads.tsr_cube_head import build_tsr_cube_head
 from cubercnn.modeling.proposal_generator.rpn import subsample_labels
 from cubercnn.modeling.roi_heads.fast_rcnn import FastRCNNOutputs
 from cubercnn import util
@@ -176,6 +177,7 @@ class ROIHeads3D(StandardROIHeads):
         )
 
         cube_head = build_cube_head(cfg, shape)
+        # cube_head = build_tsr_cube_head(cfg, shape)
 
         return {
             'cube_head': cube_head,
