@@ -57,10 +57,25 @@ class YOLO3DWrapper(nn.Module):
         self.yolo_model = YOLO(yolo_yaml).model
 
         if pretrained_weights:
-            self.load_yolo_pretrained(self.yolo_model, pretrained_weights)
+            self.pretrained_load_info = self.load_yolo_pretrained(
+                self.yolo_model,
+                pretrained_weights,
+            )
+        else:
+            self.pretrained_load_info = None
+            LOGGER.info("No pretrained YOLO weights supplied; training from random initialization.")
 
-        self.criterion = E2EDetect3DLoss(self.yolo_model) if is_e2e else Detect3DLoss(self.yolo_model)
-        self.criterion.to(self.device)
+        # Criterion type and Detect3D output structure must agree.
+        head = self.yolo_model.model[-1]
+        head_is_e2e = bool(getattr(head, "end2end", True))
+        if bool(is_e2e) != head_is_e2e:
+            raise ValueError(
+                "YOLO3D E2E configuration mismatch: "
+                f"cfg.MODEL.YOLO3D.IS_E2E={bool(is_e2e)}, "
+                f"but Detect3D.end2end={head_is_e2e}."
+            )
+        self.is_e2e = head_is_e2e
+        self._build_criterion()
 
     @classmethod
     def from_config(cls, cfg, priors=None):
@@ -78,50 +93,111 @@ class YOLO3DWrapper(nn.Module):
         }
 
     @staticmethod
-    def load_yolo_pretrained(yolo_model: nn.Module, pt_path: str):
-        if not pt_path:
-            return
-        LOGGER.info(f"Loading YOLO Backbone + Neck weights from: {pt_path}")
-        ckpt = torch.load(pt_path, map_location="cpu")
-        candidate = ckpt.get("ema") or ckpt.get("model") if isinstance(ckpt, dict) else ckpt
+    def load_yolo_pretrained(
+        yolo_model: nn.Module,
+        pt_path: str,
+        min_coverage: float = 0.80,
+    ) -> Dict[str, Any]:
+        """Load only compatible backbone/neck tensors and verify coverage."""
+        LOGGER.info(f"Loading YOLO backbone + neck weights from: {pt_path}")
+        try:
+            ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+        except TypeError:  # compatibility with older PyTorch
+            ckpt = torch.load(pt_path, map_location="cpu")
+
+        if isinstance(ckpt, dict):
+            candidate = ckpt.get("ema")
+            if candidate is None:
+                candidate = ckpt.get("model")
+            if candidate is None:
+                candidate = ckpt.get("state_dict")
+            if candidate is None:
+                candidate = ckpt
+        else:
+            candidate = ckpt
+
         if isinstance(candidate, nn.Module):
             src_sd = candidate.float().state_dict()
         elif isinstance(candidate, dict):
             src_sd = candidate
         else:
-            src_sd = ckpt
+            raise TypeError(
+                f"Unsupported pretrained checkpoint object: {type(candidate).__name__}"
+            )
 
         target_sd = yolo_model.state_dict()
         head_idx = len(yolo_model.model) - 1
         head_prefix = f"model.{head_idx}."
 
+        normalized_src = {}
+        for key, value in src_sd.items():
+            while key.startswith("module."):
+                key = key[len("module."):]
+            if isinstance(value, nn.Parameter):
+                value = value.detach()
+            if torch.is_tensor(value):
+                normalized_src[key] = value
+
+        eligible = [key for key in target_sd if not key.startswith(head_prefix)]
         filtered_sd = {}
-        head_keys_skipped = 0
-        mismatched_keys = 0
-        for k, v in src_sd.items():
-            if k.startswith(head_prefix):
-                head_keys_skipped += 1
-                continue
-            if k in target_sd:
-                if target_sd[k].shape == v.shape:
-                    filtered_sd[k] = v
-                else:
-                    mismatched_keys += 1
-                    LOGGER.warning(f"Shape mismatch, skip {k}: ckpt {v.shape} vs model {target_sd[k].shape}")
+        missing = []
+        mismatched = []
+        for key in eligible:
+            value = normalized_src.get(key)
+            if value is None:
+                missing.append(key)
+            elif value.shape != target_sd[key].shape:
+                mismatched.append((key, tuple(value.shape), tuple(target_sd[key].shape)))
+            else:
+                filtered_sd[key] = value
 
         yolo_model.load_state_dict(filtered_sd, strict=False)
+        coverage = len(filtered_sd) / max(len(eligible), 1)
         LOGGER.info(
-            f"Transferred {len(filtered_sd)} tensors to Backbone+Neck. "
-            f"Skipped {head_keys_skipped} Head tensors. "
-            f"Head parameters remained randomly initialized."
+            "YOLO pretrained load: "
+            f"loaded={len(filtered_sd)}/{len(eligible)} "
+            f"({coverage:.2%}), missing={len(missing)}, "
+            f"shape_mismatch={len(mismatched)}; Detect3D skipped."
         )
+        if mismatched:
+            LOGGER.warning(
+                "First pretrained shape mismatches: "
+                + "; ".join(
+                    f"{key}: ckpt={src}, model={dst}"
+                    for key, src, dst in mismatched[:10]
+                )
+            )
+        if coverage < min_coverage:
+            raise RuntimeError(
+                "Pretrained backbone/neck coverage is too low: "
+                f"{coverage:.2%} < {min_coverage:.2%}. "
+                "Check that checkpoint scale and YAML architecture match."
+            )
+        return {
+            "loaded": len(filtered_sd),
+            "eligible": len(eligible),
+            "coverage": coverage,
+            "missing": len(missing),
+            "shape_mismatch": len(mismatched),
+        }
+
+    def _build_criterion(self):
+        """Build loss after head configuration and priors are finalized."""
+        self.criterion = (
+            E2EDetect3DLoss(self.yolo_model)
+            if self.is_e2e
+            else Detect3DLoss(self.yolo_model)
+        )
+        self.criterion.to(self.device)
 
     def set_priors(self, priors: dict):
+        """Install Cube priors and rebuild loss to avoid stale buffer references."""
         head = self.yolo_model.model[-1]
-        if hasattr(head, "set_priors"):
-            head.set_priors(priors)
-        else:
+        if not hasattr(head, "set_priors"):
             LOGGER.warning("The model head has no 'set_priors' method implemented.")
+            return
+        head.set_priors(priors)
+        self._build_criterion()
 
     @property
     def device(self):
@@ -243,8 +319,11 @@ class YOLO3DWrapper(nn.Module):
         if head.end2end:
             pred_2d, cube_preds, _ = out
         else:
-            y, cube_feats, _ = out
-            pred_2d, cube_preds = head.postprocess(y.permute(0, 2, 1), cube_feats)
+            y, dense_cube_preds, _ = out
+            pred_2d, cube_preds = head.postprocess(
+                y.permute(0, 2, 1),
+                dense_cube_preds,
+            )
 
         results = []
         for i, x in enumerate(batched_inputs):

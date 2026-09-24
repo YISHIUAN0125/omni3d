@@ -350,6 +350,7 @@ class CubeLoss(nn.Module):
         self.disentangled_loss = model_head.disentangled_loss
         self.chamfer_pose = model_head.chamfer_pose
         self.allocentric_pose = model_head.allocentric_pose
+        self.pose_type = model_head.pose_type
         self.z_type = model_head.z_type
         self.cluster_bins = model_head.cluster_bins
         self.use_conf = model_head.use_conf
@@ -490,13 +491,13 @@ class CubeLoss(nn.Module):
                 src_scales = (src_h**2 + src_w**2).sqrt()
                 scales_diff = (self.priors_z_scales.detach().T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
                 assignments = scales_diff.argmin(1)
-                assigned_bins = assignments[torch.arange(n_fg), box_classes]
+                assigned_bins = assignments[torch.arange(n_fg, device=device), box_classes]
 
                 z_stats = self.priors_z_stats.detach()
                 z_means = z_stats[:, :, 0].T.unsqueeze(0).repeat([n_fg, 1, 1])
-                z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg), box_classes]
+                z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg, device=device), box_classes]
                 z_stds = z_stats[:, :, 1].T.unsqueeze(0).repeat([n_fg, 1, 1])
-                z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg), box_classes]
+                z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg, device=device), box_classes]
 
                 z_norm_pred = raw_z.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
                 loss_z = self.l1_loss(z_norm_pred, (z_target - z_means) / z_stds)
@@ -796,15 +797,18 @@ class Detect3DLoss(v8DetectionLoss):
         loss[0], loss[1], loss[2] = det_loss[0], det_loss[1], det_loss[2]
         loss_items = dict(zip(self.loss_names[:3], det_loss.detach()))
 
-        cube_modules = self.head.cube_one2one if self.is_one2one else self.head.cube_one2many
 
         # compute 3d loss
         if fg_mask.sum():
             weight = target_scores[fg_mask].sum(-1, keepdim=True)  # (n_fg, 1)
 
-            cube_feats = branch["cube_feats"]
-            fg_feats = cube_feats[fg_mask]
-            cube_preds = self.head._run_3d_mlp(fg_feats, **cube_modules)
+            # The Spatial Cube head already predicts every P3-P5 location.
+            # TAL supplies the sparse supervision mask only at loss time.
+            dense_cube_preds = branch["cube_preds"]
+            cube_preds = {
+                name: value[fg_mask]
+                for name, value in dense_cube_preds.items()
+            }
 
             fg_batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1).repeat(1, fg_mask.shape[1])[fg_mask]
             fg_gt_idx = target_gt_idx[fg_mask]
@@ -866,13 +870,13 @@ class Detect3DLoss(v8DetectionLoss):
             loss_items.update(det_3d_items)
             loss_items["loss_3d"] = l_3d.detach()
         else:
-            # ── 改動 ④(另一半)：DDP 防禦掃過整個 cube_modules，不只 cube_tower ──
-            zero_dummy = sum(
-                p.sum() * 0.0
-                for mod in cube_modules.values() if mod is not None
-                for p in mod.parameters()
+            # Dense heads were executed even when this batch has no foreground.
+            # Touch every output so all Spatial Cube parameters remain in the
+            # autograd graph and DDP does not report unused parameters.
+            loss[3] += sum(
+                value.sum() * 0.0
+                for value in branch["cube_preds"].values()
             )
-            loss[3] += (branch["cube_feats"].sum() * 0.0) + zero_dummy
             loss_items["loss_3d"] = torch.tensor(0.0, device=self.device)
 
         return loss * batch_size, loss_items

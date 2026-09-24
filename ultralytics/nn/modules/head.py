@@ -294,6 +294,60 @@ class Detect(nn.Module):
 # -------------------------------------------------
 # Detect3D
 # -------------------------------------------------
+class SpatialCubeBranch(nn.Module):
+    """Dense spatial Cube regression branch.
+
+    The effective receptive field is 3x3: one shared 3x3 geometry stem,
+    followed by task-specific 1x1 projections and 1x1 prediction layers.
+    Batch Normalization is applied via standard Ultralytics Conv blocks.
+    """
+
+    def __init__(self, channels: int, pose_dim: int, z_dim: int, use_conf: bool):
+        super().__init__()
+
+        # Shared 3x3 stem: Conv2d(3x3) -> BatchNorm2d -> SiLU
+        self.spatial = Conv(channels, channels, k=3, s=1, p=1, act=True)
+
+        def task_head(out_channels: int) -> nn.Sequential:
+            return nn.Sequential(
+                Conv(channels, channels, k=1, s=1, act=True),
+                nn.Conv2d(channels, out_channels, 1, bias=True),
+            )
+
+        self.deltas = task_head(2)
+        self.dims = task_head(3)
+        self.pose = task_head(pose_dim)
+        self.z = task_head(z_dim)
+        self.uncert = task_head(1) if use_conf else None
+        self.reset_parameters()
+
+    @staticmethod
+    def _init_output(head: nn.Sequential, bias: float = 0.0) -> None:
+        output = head[-1]
+        nn.init.normal_(output.weight, std=0.001)
+        nn.init.constant_(output.bias, bias)
+
+    def reset_parameters(self) -> None:
+        self._init_output(self.deltas)
+        self._init_output(self.dims)
+        self._init_output(self.pose)
+        self._init_output(self.z)
+        if self.uncert is not None:
+            self._init_output(self.uncert, bias=5.0)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        x = self.spatial(x)
+        out = {
+            "deltas": self.deltas(x),
+            "dims": self.dims(x),
+            "pose": self.pose(x),
+            "z": self.z(x),
+        }
+        if self.uncert is not None:
+            out["uncert"] = self.uncert(x).clamp(min=0.01)
+        return out
+
+
 class Detect3D(Detect):
     def __init__(
         self,
@@ -314,7 +368,7 @@ class Detect3D(Detect):
         end2end: bool = True,
         ch: tuple = (),
     ):
-        super().__init__(nc=nc, reg_max=reg_max, end2end=True, ch=ch)
+        super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
         self.end2end = end2end
         self.pose_type = pose_type
         self.use_conf = use_conf
@@ -329,7 +383,6 @@ class Detect3D(Detect):
         self.cluster_bins = cluster_bins
         self.priors = priors
         pose_dim = {"6d": 6, "quaternion": 4, "euler": 3}[pose_type]
-        c4 = max(ch[0], min(self.nc, 100))
 
         if self.dims_priors_enabled and priors is not None and "priors_dims_per_cat" in priors:
             priors_dims = torch.as_tensor(priors["priors_dims_per_cat"], dtype=torch.float32).unsqueeze(0)
@@ -357,77 +410,53 @@ class Detect3D(Detect):
                 ])
             self.register_buffer("priors_z_stats", priors_z_stats, persistent=True)
 
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3)) for x in ch)
-        self.cube_tower = MLP(c4, c4, c4, 2, nn.SiLU, False, residual=True, out_norm=nn.LayerNorm(c4))
-        self.cube_2d_deltas_pred = nn.Linear(c4, 2)
-        self.cube_dims_pred = nn.Linear(c4, 3)
-        self.cube_pose_pred = nn.Linear(c4, pose_dim)
-        self.cube_z_pred = nn.Linear(c4, max(cluster_bins, 1))
-        if self.use_conf:
-            self.cube_uncert_pred = nn.Linear(c4, 1)
+        # Spatial Dense Cube head.
+        c4 = min(256, max(128, ch[0] // 2))
+        self.cube_channels = c4
+        
+        # 使用 conv.py 中的 Conv 模組取代原本的 Conv2d + GroupNorm + SiLU
+        self.cv4 = nn.ModuleList(Conv(x, c4, k=1, s=1, act=True) for x in ch)
+        self.cube_branch = SpatialCubeBranch(
+            channels=c4,
+            pose_dim=pose_dim,
+            z_dim=max(cluster_bins, 1),
+            use_conf=self.use_conf,
+        )
 
-        self._init_cube_weights(self.cube_2d_deltas_pred, self.cube_dims_pred,
-                                 self.cube_pose_pred, getattr(self, "cube_uncert_pred", None))
-
+        # O2O keeps private parameters and receives detached neck features
         self.one2one_cv4 = copy.deepcopy(self.cv4)
-        self.one2one_cube_tower = copy.deepcopy(self.cube_tower)
-        self.one2one_cube_2d_deltas_pred = copy.deepcopy(self.cube_2d_deltas_pred)
-        self.one2one_cube_dims_pred = copy.deepcopy(self.cube_dims_pred)
-        self.one2one_cube_pose_pred = copy.deepcopy(self.cube_pose_pred)
-        self.one2one_cube_z_pred = copy.deepcopy(self.cube_z_pred)
-        if self.use_conf:
-            self.one2one_cube_uncert_pred = copy.deepcopy(self.cube_uncert_pred)
-
-    def _init_cube_weights(self, deltas, dims, pose, uncert):
-        for p in (deltas, dims, pose):
-            nn.init.normal_(p.weight, std=0.001)
-            nn.init.constant_(p.bias, 0.0)
-        if uncert is not None:
-            nn.init.normal_(uncert.weight, std=0.001)
-            nn.init.constant_(uncert.bias, 5.0)
+        self.one2one_cube_branch = copy.deepcopy(self.cube_branch)
 
     @property
     def cube_one2many(self) -> dict[str, nn.Module]:
-        return{
-            "cube_tower": self.cube_tower,
-            "deltas_head": self.cube_2d_deltas_pred,
-            "dims_head": self.cube_dims_pred,
-            "pose_head": self.cube_pose_pred,
-            "z_head": self.cube_z_pred,
-            "uncert_head": getattr(self, "cube_uncert_pred", None),            
-        }
+        return {"cube_branch": self.cube_branch}
 
     @property
     def cube_one2one(self) -> dict[str, nn.Module]:
-        return {
-            "cube_tower": self.one2one_cube_tower,
-            "deltas_head": self.one2one_cube_2d_deltas_pred,
-            "dims_head": self.one2one_cube_dims_pred,
-            "pose_head": self.one2one_cube_pose_pred,
-            "z_head": self.one2one_cube_z_pred,
-            "uncert_head": getattr(self, "one2one_cube_uncert_pred", None),
-        }
+        return {"cube_branch": self.one2one_cube_branch}
 
-    def _run_3d_mlp(
+    @staticmethod
+    def _flatten_cube_map(x: torch.Tensor) -> torch.Tensor:
+        """Convert (B, D, H, W) to anchor-major (B, H*W, D)."""
+        return x.flatten(2).transpose(1, 2).contiguous()
+
+    def forward_cube(
         self,
-        point_features: torch.Tensor,
-        cube_tower: nn.Module,
-        deltas_head: nn.Module,
-        dims_head: nn.Module,
-        pose_head: nn.Module,
-        z_head: nn.Module,
-        uncert_head: nn.Module = None,
+        x: list[torch.Tensor],
+        adapters: nn.ModuleList,
+        cube_branch: SpatialCubeBranch,
     ) -> dict[str, torch.Tensor]:
-        cube_feat = cube_tower(point_features)
-        preds = {
-            "deltas": deltas_head(cube_feat),
-            "dims": dims_head(cube_feat),
-            "pose": pose_head(cube_feat),
-            "z": z_head(cube_feat),
-        }
-        if uncert_head is not None:
-            preds["uncert"] = uncert_head(cube_feat).clamp(min=0.01).squeeze(-1)
-        return preds
+        """Run full dense 3D regression on all P3-P5 locations."""
+        per_task: dict[str, list[torch.Tensor]] = {}
+        for level, feat in enumerate(x):
+            level_pred = cube_branch(adapters[level](feat))
+            for name, value in level_pred.items():
+                per_task.setdefault(name, []).append(self._flatten_cube_map(value))
+
+        outputs = {name: torch.cat(values, dim=1) for name, values in per_task.items()}
+        if "uncert" in outputs:
+            outputs["uncert"] = outputs["uncert"].squeeze(-1)
+        return outputs
 
     def set_priors(self, priors: dict):
         if priors is None:
@@ -457,7 +486,7 @@ class Detect3D(Detect):
         cube_preds: dict[str, torch.Tensor],
         box_classes: torch.Tensor,
         src_boxes: torch.Tensor,
-        Ks_scaled_per_box: torch.Tensor, # Scaled Ks per box
+        Ks_scaled_per_box: torch.Tensor,
         focal_lengths: torch.Tensor,
         im_scales_orig: torch.Tensor,
         im_scales: torch.Tensor,
@@ -476,7 +505,7 @@ class Detect3D(Detect):
 
         dims_norm = cube_preds["dims"].clamp(min=-5.0, max=5.0)
         if self.dims_priors_enabled:
-            prior_dims = self.priors_dims_per_cat.detach()[0, box_classes]  # (N, 2, 3)
+            prior_dims = self.priors_dims_per_cat.detach()[0, box_classes]
             prior_mean = prior_dims[:, 0, :]
             prior_std = prior_dims[:, 1, :]
 
@@ -514,30 +543,30 @@ class Detect3D(Detect):
             z_mins = (z_means - 3 * z_stds).clamp(min=0.0)
             z_maxs = (z_means + 3 * z_stds)
 
-            z_sel = z_raw.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)  # 依 bin 選值，這行是新增的關鍵
+            z_sel = z_raw.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
             cube_z = cubeutil.scaled_sigmoid(z_sel, min=z_mins, max=z_maxs)
 
         elif self.z_type == "sigmoid":
             cube_z = torch.sigmoid(z_raw[:, 0]) * 100
         elif self.z_type == "log":
             cube_z = torch.exp(z_raw[:, 0].clamp(min=-5, max=8))
-        else:  # direct
+        else:
             cube_z = z_raw[:, 0]
 
         if self.virtual_depth:
             virtual_to_real = cubeutil.compute_virtual_scale_from_focal_spaces(
                 focal_lengths,
-                im_scales_orig,       
-                self.virtual_focal,   
-                im_scales             
+                im_scales_orig,
+                self.virtual_focal,
+                im_scales
             )
             cube_z = cube_z * virtual_to_real
 
         cube_x3d = cube_z * (cube_x - Ks_scaled_per_box[:, 0, 2]) / Ks_scaled_per_box[:, 0, 0]
-        cube_y3d = cube_z * (cube_y -Ks_scaled_per_box[:, 1, 2]) / Ks_scaled_per_box[:, 1, 1]
+        cube_y3d = cube_z * (cube_y - Ks_scaled_per_box[:, 1, 2]) / Ks_scaled_per_box[:, 1, 1]
         cube_center_cam = torch.stack([cube_x3d, cube_y3d, cube_z], dim=-1)
 
-        if self.allocentric_pose == True:
+        if self.allocentric_pose:
             cube_pose = cubeutil.R_from_allocentric(Ks_scaled_per_box, cube_pose, u=cube_x.detach(), v=cube_y.detach())
 
         out = {
@@ -556,62 +585,59 @@ class Detect3D(Detect):
 
         return out
 
-    def forward_cube(self, x: list[torch.Tensor], cv4: nn.ModuleList) -> torch.Tensor:
-        bs = x[0].shape[0]
-        c4 = cv4[0][-1].conv.out_channels if hasattr(cv4[0][-1], "conv") else cv4[0][-1].out_channels
-        feats = torch.cat(
-            [cv4[i](x[i]).view(bs, c4, -1) for i in range(self.nl)], dim=-1
-        )
-        return feats.transpose(1, 2)  # (bs, total_anchors, c4)
-
     def forward(self, x: list[torch.Tensor]):
         preds = self.forward_head(x, **self.one2many)
-        preds["cube_feats"] = self.forward_cube(x, self.cv4)
+        preds["cube_preds"] = self.forward_cube(x, self.cv4, self.cube_branch)
 
-        x_detach = [xi.detach() for xi in x] if self.training else x
-        one2one = self.forward_head(x_detach, **self.one2one)
-        one2one["cube_feats"] = self.forward_cube(x_detach, self.one2one_cv4)
+        has_o2o = getattr(self, "one2one_cv2", None) is not None
+        one2one = None
+        if has_o2o:
+            x_o2o = [xi.detach() for xi in x] if self.training else x
+            one2one = self.forward_head(x_o2o, **self.one2one)
+            one2one["cube_preds"] = self.forward_cube(
+                x_o2o, self.one2one_cv4, self.one2one_cube_branch
+            )
 
         if self.training:
-            if getattr(self, "one2one_cv4", None) is not None:
-                preds = {"one2many": preds, "one2one": one2one}
-            return preds
+            return {"one2many": preds, "one2one": one2one} if has_o2o else preds
 
-        use_one2one = self.end2end and getattr(self, "one2one_cv2", None) is not None
+        use_one2one = self.end2end and has_o2o
         base = one2one if use_one2one else preds
-        cube_feats = one2one["cube_feats"] if use_one2one else preds["cube_feats"]
-        cube_modules = self.cube_one2one if use_one2one else self.cube_one2many
-
-        y = self._inference(base)  # (bs, 4 + nc, total_anchors)
+        y = self._inference(base)
 
         if self.end2end:
-            y, cube_preds = self.postprocess(y.permute(0, 2, 1), cube_feats, cube_modules)
-            return (y, cube_preds) if self.export else (y, cube_preds, preds)
+            y, cube_preds = self.postprocess(y.permute(0, 2, 1), base["cube_preds"])
+            raw = {"one2many": preds, "one2one": one2one} if has_o2o else preds
+            return (y, cube_preds) if self.export else (y, cube_preds, raw)
 
-        return (y, cube_feats) if self.export else (y, cube_feats, preds)
+        return (y, base["cube_preds"]) if self.export else (y, base["cube_preds"], preds)
 
     def postprocess(
-        self, 
-        preds: torch.Tensor, 
-        cube_feats: torch.Tensor, 
-        cube_modules: dict[str, nn.Module]
+        self,
+        preds: torch.Tensor,
+        cube_preds: dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-
-        boxes, scores, *extra = preds.split([s for s in (4, self.nc, preds.shape[-1] - 4 - self.nc) if s], dim=-1)
-        scores, conf, idx = self.get_topk_index(scores, self.max_det)
-
-        # (bs, max_det, 6 + extra)
-        pred_2d = torch.cat(
-            [self._gather(boxes, idx), scores, conf, *(self._gather(e, idx) for e in extra)], 
-            dim=-1
+        boxes, scores, *extra = preds.split(
+            [size for size in (4, self.nc, preds.shape[-1] - 4 - self.nc) if size],
+            dim=-1,
         )
+        scores, conf, idx = self.get_topk_index(scores, self.max_det)
+        pred_2d = torch.cat(
+            [self._gather(boxes, idx), scores, conf, *(self._gather(e, idx) for e in extra)],
+            dim=-1,
+        )
+        selected_cube = {name: self._gather(value, idx) for name, value in cube_preds.items()}
+        return pred_2d, selected_cube
 
-        # (bs, max_det, c4)
-        topk_cube_feats = self._gather(cube_feats, idx)
-        cube_preds = self._run_3d_mlp(topk_cube_feats, **cube_modules)
-
-        return pred_2d, cube_preds
-
+    def fuse(self) -> None:
+        end2end = self.end2end
+        super().fuse()
+        if end2end:
+            self.cv4 = None
+            self.cube_branch = None
+        else:
+            self.one2one_cv4 = None
+            self.one2one_cube_branch = None
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
