@@ -378,6 +378,61 @@ class TaskAlignedAssigner(nn.Module):
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
 
+class TaskAlignedAssigner3D(TaskAlignedAssigner):
+    def __init__(self, *args, gamma: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = gamma
+        self._quality3d = None
+
+    def set_gamma(self, gamma: float) -> None:
+        """Update the 3D exponent, enabling an external warm-up schedule."""
+        if gamma < 0:
+            raise ValueError("Gamma must be non-negative")
+        self.gamma = float(gamma)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        pd_scores,
+        pd_bboxes,
+        anc_points,
+        gt_labels,
+        gt_bboxes,
+        mask_gt,
+        quality3d=None,
+    ):
+        if quality3d is None or self.gamma == 0.0:
+            return super().forward(
+                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            )
+        expected = (pd_scores.shape[0], gt_bboxes.shape[1], pd_scores.shape[1])
+        if tuple(quality3d.shape) != expected:
+            raise ValueError(
+                f"quality3d has shape {tuple(quality3d.shape)}, expected {expected}"
+            )
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        if self.n_max_boxes == 0:
+            return super().forward(
+                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            )
+        self._quality3d = quality3d.detach().clamp(min=self.eps, max=1.0)
+        try:
+            return self._forward(
+                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            )
+        finally:
+            self._quality3d = None
+
+    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+        align_metric, overlaps = super().get_box_metrics(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt
+        )
+        if self._quality3d is not None:
+            quality = self._quality3d.to(device=align_metric.device, dtype=align_metric.dtype)
+            align_metric = align_metric * quality.pow(self.gamma)
+        return align_metric, overlaps
+
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
