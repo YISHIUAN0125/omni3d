@@ -14,7 +14,7 @@ from cubercnn import util as cubeutil
 
 from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
-from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, dist2bbox, dist2rbox, make_anchors
+from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, TaskAlignedAssigner3D, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
 
 from pytorch3d.transforms.rotation_conversions import _copysign
@@ -23,6 +23,7 @@ from pytorch3d.transforms.so3 import so3_relative_angle
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
+from .mgiou import CM3DConfig, CubeMGIoUQualityBuilder
 
 
 class VarifocalLoss(nn.Module):
@@ -350,6 +351,7 @@ class CubeLoss(nn.Module):
         self.disentangled_loss = model_head.disentangled_loss
         self.chamfer_pose = model_head.chamfer_pose
         self.allocentric_pose = model_head.allocentric_pose
+        self.pose_type = model_head.pose_type
         self.z_type = model_head.z_type
         self.cluster_bins = model_head.cluster_bins
         self.use_conf = model_head.use_conf
@@ -490,13 +492,13 @@ class CubeLoss(nn.Module):
                 src_scales = (src_h**2 + src_w**2).sqrt()
                 scales_diff = (self.priors_z_scales.detach().T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
                 assignments = scales_diff.argmin(1)
-                assigned_bins = assignments[torch.arange(n_fg), box_classes]
+                assigned_bins = assignments[torch.arange(n_fg, device=device), box_classes]
 
                 z_stats = self.priors_z_stats.detach()
                 z_means = z_stats[:, :, 0].T.unsqueeze(0).repeat([n_fg, 1, 1])
-                z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg), box_classes]
+                z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg, device=device), box_classes]
                 z_stds = z_stats[:, :, 1].T.unsqueeze(0).repeat([n_fg, 1, 1])
-                z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg), box_classes]
+                z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[torch.arange(n_fg, device=device), box_classes]
 
                 z_norm_pred = raw_z.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
                 loss_z = self.l1_loss(z_norm_pred, (z_target - z_means) / z_stds)
@@ -722,6 +724,22 @@ class Detect3DLoss(v8DetectionLoss):
                  tal_topk2: int | None = None, is_one2one: bool = False):
         super().__init__(model=model, tal_topk=tal_topk, tal_topk2=tal_topk2)
         m = model.model[-1]
+        self.cm3d_config = CM3DConfig(
+            gamma=float(getattr(m, "cm3d_gamma", 1.0)),
+            quality_floor=float(getattr(m, "cm3d_quality_floor", 0.05)),
+            fast_mode=bool(getattr(m, "cm3d_fast_mode", True)),
+            corner_order=getattr(m, "cm3d_corner_order", None),
+        )
+        self.assigner = TaskAlignedAssigner3D(
+            topk=tal_topk,
+            num_classes=self.nc,
+            alpha=float(getattr(m, "cm3d_alpha", 0.5)),
+            beta=float(getattr(m, "cm3d_beta", 1.0)),
+            gamma=self.cm3d_config.gamma,
+            stride=self.stride.tolist(),
+            topk2=tal_topk2,
+        )
+        self.cm3d_quality = CubeMGIoUQualityBuilder(m, self.cm3d_config)
         self.head = m
         self.cube_loss = CubeLoss(m)
         self.loss_names = (*self.loss_names, "loss_3d")
@@ -744,11 +762,24 @@ class Detect3DLoss(v8DetectionLoss):
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_bboxes_px = (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype)
+        anchor_points_px = anchor_points * stride_tensor
+        quality3d = self.cm3d_quality(
+            branch=preds,
+            batch=batch,
+            pred_boxes_px=pred_bboxes_px,
+            anchor_points_px=anchor_points_px,
+            gt_labels=gt_labels,
+            gt_boxes2d=gt_bboxes,
+            mask_gt=mask_gt,
+            assigner=self.assigner,
+        )
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
+            pred_bboxes_px,
+            anchor_points_px,
             gt_labels, gt_bboxes, mask_gt,
+            quality3d=quality3d,
         )
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -763,19 +794,22 @@ class Detect3DLoss(v8DetectionLoss):
                 target_bboxes / stride_tensor, target_scores, target_scores_sum,
                 fg_mask, imgsz, stride_tensor,
             )
-        # print(self.hyp.keys())
+        else:
+            loss[0] += pred_distri[..., :0].sum()
+
         loss[0] *= self.hyp["box"]
         loss[1] *= self.hyp["cls"]
         loss[2] *= self.hyp["dfl"]
-        # loss[0] *= self.hyp.box
-        # loss[1] *= self.hyp.cls
-        # loss[2] *= self.hyp.dfl
 
-        return (
-            (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor,
-             target_scores, target_scores_sum, pred_bboxes),
-            loss, loss.detach(),
+        assigned_tuple = (
+            fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor,
+            target_scores, target_scores_sum, pred_bboxes_px
         )
+        return assigned_tuple, loss, loss.detach()
+
+    def set_cm3d_gamma(self, gamma: float) -> None:
+        """Public hook for epoch/iteration-based CM3D warm-up."""
+        self.assigner.set_gamma(gamma)
 
     def parse_output(self, preds):
         return preds[-1] if isinstance(preds, tuple) else preds
@@ -787,7 +821,7 @@ class Detect3DLoss(v8DetectionLoss):
 
         (
             (fg_mask, target_gt_idx, target_bboxes, anchor_points, stride_tensor,
-             target_scores, target_scores_sum, pred_bboxes),
+             target_scores, target_scores_sum, pred_bboxes_px),
             det_loss, _,
         ) = self.get_assigned_targets_and_loss(branch, batch)
 
@@ -796,15 +830,15 @@ class Detect3DLoss(v8DetectionLoss):
         loss[0], loss[1], loss[2] = det_loss[0], det_loss[1], det_loss[2]
         loss_items = dict(zip(self.loss_names[:3], det_loss.detach()))
 
-        cube_modules = self.head.cube_one2one if self.is_one2one else self.head.cube_one2many
-
         # compute 3d loss
         if fg_mask.sum():
             weight = target_scores[fg_mask].sum(-1, keepdim=True)  # (n_fg, 1)
 
-            cube_feats = branch["cube_feats"]
-            fg_feats = cube_feats[fg_mask]
-            cube_preds = self.head._run_3d_mlp(fg_feats, **cube_modules)
+            dense_cube_preds = branch["cube_preds"]
+            cube_preds = {
+                name: value[fg_mask]
+                for name, value in dense_cube_preds.items()
+            }
 
             fg_batch_idx = torch.arange(batch_size, device=self.device).unsqueeze(1).repeat(1, fg_mask.shape[1])[fg_mask]
             fg_gt_idx = target_gt_idx[fg_mask]
@@ -826,12 +860,10 @@ class Detect3DLoss(v8DetectionLoss):
             Ks = orig_Ks / im_ratios.view(-1, 1, 1)
             Ks[:, -1, -1] = 1.0
 
-            # 2. 取【原始解析度】的焦距 fy
             focal_lengths = orig_Ks[:, 1, 1] 
             im_scales = batch["im_scales"].to(self.device)[fg_batch_idx]
             im_scales_orig = batch["im_scales_orig"].to(self.device)[fg_batch_idx]
 
-            # 3. 使用 cubeutil 計算 virtual_to_real 與其倒數 real_to_virtual
             if self.head.virtual_depth:
                 virtual_to_real = cubeutil.compute_virtual_scale_from_focal_spaces(
                     focal_lengths,
@@ -843,9 +875,9 @@ class Detect3DLoss(v8DetectionLoss):
             else:
                 virtual_to_real = real_to_virtual = torch.ones_like(focal_lengths)
 
-            src_boxes = target_bboxes[fg_mask]
+            # 修正：使用 pred_bboxes_px[fg_mask] 作為 src_boxes，與 QualityBuilder 保持完全一致
+            src_boxes = pred_bboxes_px[fg_mask]
 
-            # 4. 傳入 decode_cube (注意參數名保持一致)
             cube_decoded = self.head.decode_cube(
                 cube_preds=cube_preds, 
                 box_classes=box_classes, 
@@ -856,7 +888,6 @@ class Detect3DLoss(v8DetectionLoss):
                 im_scales=im_scales,
             )
 
-            # 5. 計算 3D 損失 (將 real_to_virtual 傳給 CubeLoss 監督 raw_z)
             l_3d, det_3d_items = self.cube_loss(
                 cube_preds=cube_preds, cube_decoded=cube_decoded, gt_box3d=gt_box3d, gt_pose=gt_pose,
                 gt_2d=gt_2d, src_boxes=src_boxes, box_classes=box_classes, Ks=Ks,
@@ -866,13 +897,10 @@ class Detect3DLoss(v8DetectionLoss):
             loss_items.update(det_3d_items)
             loss_items["loss_3d"] = l_3d.detach()
         else:
-            # ── 改動 ④(另一半)：DDP 防禦掃過整個 cube_modules，不只 cube_tower ──
-            zero_dummy = sum(
-                p.sum() * 0.0
-                for mod in cube_modules.values() if mod is not None
-                for p in mod.parameters()
+            loss[3] += sum(
+                value.sum() * 0.0
+                for value in branch["cube_preds"].values()
             )
-            loss[3] += (branch["cube_feats"].sum() * 0.0) + zero_dummy
             loss_items["loss_3d"] = torch.tensor(0.0, device=self.device)
 
         return loss * batch_size, loss_items
@@ -880,6 +908,7 @@ class Detect3DLoss(v8DetectionLoss):
     def to(self, device):
         self.device = torch.device(device)
         return self
+
 
 class E2EDetect3DLoss:
     """Criterion class for end-to-end (one2many + one2one dual head) 3D detection."""
@@ -921,7 +950,9 @@ class E2EDetect3DLoss:
         self.o2o = max(self.total - self.o2m, 0.0)
 
     def decay(self, x: int) -> float:
-        epochs = max(getattr(self.one2one.hyp, "epochs", 100) - 1, 1) # Need to align iter and epoch
+        hyp = self.one2one.hyp
+        total_epochs = hyp.get("epochs", 100) if isinstance(hyp, dict) else getattr(hyp, "epochs", 100)
+        epochs = max(total_epochs - 1, 1)
         return max(1.0 - x / epochs, 0.0) * (self.o2m_copy - self.final_o2m) + self.final_o2m
 
     def to(self, device):
