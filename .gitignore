@@ -18,3 +18,5 @@ cubercnn/external/
 # yolo weights
 *.pt
 pretrained/
+
+runs/
