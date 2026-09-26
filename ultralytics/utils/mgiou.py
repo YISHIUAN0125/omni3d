@@ -59,15 +59,15 @@ class CubeMGIoUQualityBuilder(nn.Module):
         within_idx = torch.arange(batch_idx.numel(), device=device) - offsets[batch_idx]
 
         # 動態相容 Omni3D 的 9 維 ([x, y, z, w, h, l, r, p, y]) 或 6 維 3D box 標籤
-        gt_dim = batch["gt_boxes3d"].shape[-1] if batch["gt_boxes3d"].numel() else 6
+        gt_dim = batch["gt_boxes3D"].shape[-1] if batch["gt_boxes3D"].numel() else 6
         boxes3d = torch.zeros(batch_size, max_gt, gt_dim, device=device)
         poses = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(batch_size, max_gt, 1, 1)
         centers2d = torch.zeros(batch_size, max_gt, 2, device=device)
         
         if batch_idx.numel():
-            boxes3d[batch_idx, within_idx] = batch["gt_boxes3d"].to(device)
+            boxes3d[batch_idx, within_idx] = batch["gt_boxes3D"].to(device)
             poses[batch_idx, within_idx] = batch["gt_poses"].to(device)
-            centers2d[batch_idx, within_idx] = batch["gt_2d"].to(device)
+            centers2d[batch_idx, within_idx] = batch["gt_2D"].to(device)
         return boxes3d, poses, centers2d
 
     def _reorder(self, corners: torch.Tensor) -> torch.Tensor:
@@ -116,10 +116,11 @@ class CubeMGIoUQualityBuilder(nn.Module):
         pair_classes = gt_labels[batch_idx, gt_idx, 0].long()
         pair_boxes2d = pred_boxes_px[batch_idx, anchor_idx]
 
-        original_k = batch["Ks"].to(device)[batch_idx]
-        scale_ratio = batch["im_scales_ratio"].to(device)[batch_idx]
-        scaled_k = original_k / scale_ratio.view(-1, 1, 1)
+        # K is already transformed to the current LetterBox input coordinates.
+        scaled_k = batch["K"].to(device)[batch_idx].clone()
         scaled_k[:, -1, -1] = 1.0
+        # K_orig is used only for the original focal space required by virtual depth.
+        original_k = batch.get("K_orig", batch["K"]).to(device)[batch_idx]
 
         decoded = self.head.decode_cube(
             cube_preds=pair_preds,
@@ -138,15 +139,10 @@ class CubeMGIoUQualityBuilder(nn.Module):
         )
         pair_gt = packed_boxes[batch_idx, gt_idx]
         pair_gt_pose = packed_poses[batch_idx, gt_idx]
-        pair_gt_center2d = packed_centers[batch_idx, gt_idx]
-        gt_z = pair_gt[:, 2]
-        gt_x = gt_z * (pair_gt_center2d[:, 0] - scaled_k[:, 0, 2]) / scaled_k[:, 0, 0]
-        gt_y = gt_z * (pair_gt_center2d[:, 1] - scaled_k[:, 1, 2]) / scaled_k[:, 1, 1]
-        
-        # 精準取 pair_gt[:, 3:6] 作為 [w, h, l]，無論 GT 是 6 維或 9 維皆相容
-        gt_box_cam = torch.cat(
-            [torch.stack([gt_x, gt_y, gt_z], dim=-1), pair_gt[:, 3:6]], dim=-1
-        )
+        # Cube R-CNN contract already stores metric camera center and dimensions.
+        # Avoid reconstructing X/Y from projected pixels, which can introduce
+        # LetterBox, flip, and pixel-rounding inconsistencies.
+        gt_box_cam = pair_gt[:, :6]
         gt_corners = cubeutil.get_cuboid_verts_faces(gt_box_cam, pair_gt_pose)[0]
 
         pred_corners = self._reorder(pred_corners).float()
