@@ -13,6 +13,54 @@ import torch
 from typing import Any
 from ultralytics.utils import LOGGER
 
+def pick_2d_box(anno: dict, filter_settings: dict):
+    tight = anno.get("bbox2D_tight")
+    if filter_settings.get("modal_2D_boxes") and tight and tight[0] != -1:
+        return _xyxy_to_xywh(tight)
+
+    trunc = anno.get("bbox2D_trunc")
+    if filter_settings.get("trunc_2D_boxes") and trunc and not all(v == -1 for v in trunc):
+        return _xyxy_to_xywh(trunc)
+
+    proj = anno.get("bbox2D_proj")
+    if proj and proj[0] != -1:
+        return _xyxy_to_xywh(proj)
+
+    return anno.get("bbox")
+
+def is_ignore(anno: dict, filter_settings: dict, image_height: int) -> bool:
+    if anno.get("behind_camera") or not bool(anno.get("valid3D", True)):
+        return True
+
+    dims = anno["dimensions"]
+    if dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0:
+        return True
+    if anno["center_cam"][2] > filter_settings["max_depth"]:
+        return True
+    if anno.get("lidar_pts", 1) == 0 or anno.get("segmentation_pts", 1) == 0:
+        return True
+    if anno.get("depth_error", 0) > 0.5:
+        return True
+
+    box2d = pick_2d_box(anno, filter_settings)
+    if box2d is None:
+        return True
+    box_h = box2d[3]
+    if box_h <= filter_settings["min_height_thres"] * image_height:
+        return True
+    if box_h >= filter_settings["max_height_thres"] * image_height:
+        return True
+
+    trunc = anno.get("truncation", -1)
+    if trunc >= 0 and trunc >= filter_settings["truncation_thres"]:
+        return True
+    vis = anno.get("visibility", -1)
+    if vis >= 0 and vis <= filter_settings["visibility_thres"]:
+        return True
+    if anno.get("category_name") in filter_settings.get("ignore_names", []):
+        return True
+
+    return False
 
 def approx_eval_resolution(h, w, scale_min=0, scale_max=1e10):
     orig_h = h
@@ -63,35 +111,6 @@ class Omni3DPriorDatasetAdapter:
 def _xyxy_to_xywh(box):
     x1, y1, x2, y2 = box
     return [x1, y1, x2 - x1, y2 - y1]
-
-
-def _official_box(ann, settings, allow_missing=False):
-    if settings.get("modal_2D_boxes") and "bbox2D_tight" in ann and ann["bbox2D_tight"][0] != -1:
-        return _xyxy_to_xywh(ann["bbox2D_tight"])
-    if settings.get("trunc_2D_boxes") and "bbox2D_trunc" in ann and not np.all([v == -1 for v in ann["bbox2D_trunc"]]):
-        return _xyxy_to_xywh(ann["bbox2D_trunc"])
-    if "bbox2D_proj" in ann:
-        return _xyxy_to_xywh(ann["bbox2D_proj"])
-    return None if allow_missing else ann.get("bbox")
-
-
-def _official_ignore_equivalent(ann, settings, image_h):
-    ignore = bool(ann.get("behind_camera", False)) or not bool(ann.get("valid3D", True))
-    if ignore:
-        return True
-    d, c = ann["dimensions"], ann["center_cam"]
-    ignore |= d[0] <= 0 or d[1] <= 0 or d[2] <= 0
-    ignore |= c[2] > settings.get("max_depth", 1e8)
-    ignore |= ann.get("lidar_pts", 1) == 0 or ann.get("segmentation_pts", 1) == 0
-    ignore |= ann.get("depth_error", 0) > 0.5
-    box = _official_box(ann, settings, allow_missing=True) or ann.get("bbox")
-    ignore |= box[3] <= settings.get("min_height_thres", 0.0) * image_h
-    ignore |= box[3] >= settings.get("max_height_thres", 1.5) * image_h
-    trunc, vis = ann.get("truncation", -1), ann.get("visibility", -1)
-    ignore |= trunc >= 0 and trunc >= settings.get("truncation_thres", 0.99)
-    ignore |= vis >= 0 and vis <= settings.get("visibility_thres", 0.01)
-    ignore |= ann.get("category_name") in settings.get("ignore_names", [])
-    return bool(ignore)
 
 
 def make_cfg(virtual_depth, virtual_focal, test_scale_min, test_scale_max,
