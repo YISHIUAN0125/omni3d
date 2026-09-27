@@ -232,16 +232,21 @@ def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset
     }
 
 
-def _cache_path_for(json_file: str, filter_settings: dict, cache_dir: Path) -> Path:
+def _cache_path_for(json_file: str, filter_settings: dict, id_map: dict, dataset_idx: int, cache_dir: Path) -> Path:
     st = os.stat(json_file)
-    key = f"{json_file}:{st.st_mtime}:{st.st_size}:{json.dumps(filter_settings, sort_keys=True)}:{CACHE_VERSION}"
+    key = (
+        f"{json_file}:{st.st_mtime}:{st.st_size}:"
+        f"{json.dumps(filter_settings, sort_keys=True)}:"
+        f"{json.dumps(id_map, sort_keys=True)}:"
+        f"{dataset_idx}:{CACHE_VERSION}"
+    )
     digest = hashlib.sha1(key.encode()).hexdigest()[:16]
     return cache_dir / f"{Path(json_file).stem}.{digest}.npz"
 
 
 def _load_or_parse_one_json(json_file: str, filter_settings: dict, id_map: dict, cache_dir: Path, dataset_idx: int = 0) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = _cache_path_for(json_file, filter_settings, cache_dir)
+    cache_file = _cache_path_for(json_file, filter_settings, id_map, dataset_idx, cache_dir)
     if cache_file.exists():
         with np.load(cache_file, allow_pickle=True) as npz:
             return {k: npz[k] for k in npz.files}
