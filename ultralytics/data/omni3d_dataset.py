@@ -1,4 +1,3 @@
-# ultralytics/data/omni3d_dataset.py
 from __future__ import annotations
 
 import hashlib
@@ -9,8 +8,8 @@ from collections import defaultdict
 from pathlib import Path
 import numpy as np
 import torch
+from typing import Any
 
-from ultralytics.utils import LOGGER
 from ultralytics.utils.instance import Instances
 from .augment import BaseTransform, Compose, Format, LetterBox
 from .base import BaseDataset
@@ -29,6 +28,10 @@ DEFAULT_FILTER_SETTINGS = {
     "max_depth": 512.0,
 }
 
+
+# -------------------------------------------------------------
+# 3D Transform
+# -------------------------------------------------------------
 _FLIP_M1 = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float32)
 _FLIP_M2 = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float32)
 
@@ -37,6 +40,7 @@ def mirror_rotation(R: np.ndarray) -> np.ndarray:
 
 
 class RandomFlip3D(BaseTransform):
+    """Horizontal flip with image and 2D/3D annotation"""
     def __init__(self, p: float = 0.5, mirror_center_x: bool = True):
         self.p = p
         self.mirror_center_x = mirror_center_x
@@ -73,6 +77,7 @@ class RandomFlip3D(BaseTransform):
 
 
 class LetterBox3D(LetterBox):
+    """Pad image and annotations to target size"""
     def __call__(self, labels: dict) -> dict:
         h0, w0 = labels["img"].shape[:2]
         labels = super().__call__(labels)
@@ -103,10 +108,53 @@ class LetterBox3D(LetterBox):
         return labels
 
 
+class Albumentations3D(BaseTransform):
+    def __init__(self, p: float = 1.0, transforms: list | None = None) -> None:
+        self.p = p
+        self.transform = None
+
+        try:
+            import os
+            os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+            import albumentations as A
+
+            T = (
+                [
+                    A.CLAHE(p=0.01),
+                    A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.2),
+                ]
+                if transforms is None
+                else transforms
+            )
+
+            for t in T:
+                if isinstance(t, A.DualTransform):
+                    raise ValueError(
+                        f"[Albumentations3D] Detect spatial transformation operater: {t.__class__.__name__}。"
+                        "Please dont use it in albumentation"
+                    )
+
+            self.transform = A.Compose(T)
+        except ImportError:
+            pass
+
+    def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
+        if self.transform is None or random.random() >= self.p:
+            return labels
+
+        im = labels["img"]
+        if im.shape[2] not in {1, 3}:
+            return labels
+
+        labels["img"] = self.transform(image=im)["image"]
+        return labels
+
+# -------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------
 def _xyxy_to_xywh(box):
     x1, y1, x2, y2 = box
     return [x1, y1, x2 - x1, y2 - y1]
-
 
 def _pick_2d_box(anno: dict, filter_settings: dict):
     tight = anno.get("bbox2D_tight")
@@ -122,7 +170,6 @@ def _pick_2d_box(anno: dict, filter_settings: dict):
         return _xyxy_to_xywh(proj)
 
     return anno.get("bbox")
-
 
 def compute_ignore_flag(anno: dict, filter_settings: dict, image_height: int) -> bool:
     if anno.get("behind_camera") or not bool(anno.get("valid3D", True)):
@@ -158,7 +205,6 @@ def compute_ignore_flag(anno: dict, filter_settings: dict, image_height: int) ->
 
     return False
 
-
 def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset_idx: int = 0) -> dict:
     with open(json_file) as f:
         data = json.load(f)
@@ -172,7 +218,7 @@ def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset
     ann_image_idx, ann_cat_id = [], []
     ann_bbox, ann_dims, ann_center, ann_R, ann_center2d, ann_ignore = [], [], [], [], [], []
 
-    # 多資料集防衝突唯一 ID 偏移
+    # ID shift
     id_offset = dataset_idx * 1_000_000
 
     for img_idx, im in enumerate(images):
@@ -337,7 +383,9 @@ class Omni3DDataset(BaseDataset):
         return label
 
     def build_transforms(self, hyp=None):
+        # TODO expose Albumentations3D possibility to yaml 
         transforms = Compose([
+            Albumentations3D(p=self.fliplr_p),
             RandomFlip3D(p=self.fliplr_p if self.augment else 0.0, mirror_center_x=self.mirror_center_x),
             LetterBox3D(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment),
         ])
