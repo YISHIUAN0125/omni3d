@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import random
+import torch.nn.functional as F
 
 from ultralytics.cfg import DEFAULT_CFG
 from ultralytics.data import build_dataloader
@@ -125,14 +127,9 @@ class Detection3DTrainer(DetectionTrainer):
     ):
         overrides = dict(overrides or {})
 
-        # Trick: pop custom arg when 
-        self.custom_val_period = overrides.pop("val_period", None)
+        # Trick: pop custom arg when passing to parent class
+        self.val_period = overrides.pop("val_period", None)
 
-        # TODO implement multiscale
-        if float(overrides.get("multi_scale", 0.0) or 0.0) > 0:
-            raise ValueError(
-                "Native multi_scale does not synchronize camera matrices (K). Set multi_scale=0.0."
-            )
         super().__init__(cfg=cfg, overrides=overrides, _callbacks=_callbacks)
         self.loss_names = SINGLE_BRANCH_LOSS_NAMES
 
@@ -327,6 +324,54 @@ class Detection3DTrainer(DetectionTrainer):
             if torch.is_tensor(value):
                 batch[key] = value.to(self.device, non_blocking=non_blocking)
 
+        # Mutiscale training
+        if getattr(self.args, "multi_scale", False) and self.model.training:
+            imgs = batch["img"]
+            stride = int(unwrap_model(self.model).stride.max() if hasattr(self.model, "stride") else 32)
+
+            ms_val = self.args.multi_scale
+            ms_factor = float(ms_val) if isinstance(ms_val, (int, float)) and not isinstance(ms_val, bool) else 0.5
+            min_sz = int(self.args.imgsz * (1.0 - ms_factor))
+            max_sz = int(self.args.imgsz * (1.0 + ms_factor))
+
+            sz = random.randrange(min_sz, max_sz + stride) // stride * stride
+            h_old, w_old = imgs.shape[2:]
+            sf = sz / max(h_old, w_old)
+
+            if sf != 1.0:
+                h_new = math.ceil(h_old * sf / stride) * stride
+                w_new = math.ceil(w_old * sf / stride) * stride
+
+                # Scale image
+                batch["img"] = F.interpolate(imgs, size=(h_new, w_new), mode="bilinear", align_corners=False)
+
+                sh = float(h_new / h_old)
+                sw = float(w_new / w_old)
+
+                # Scale camera intrinsic
+                if "K" in batch and torch.is_tensor(batch["K"]):
+                    batch["K"][:, 0, 0] *= sw  # fx
+                    batch["K"][:, 0, 2] *= sw  # cx
+                    batch["K"][:, 1, 1] *= sh  # fy
+                    batch["K"][:, 1, 2] *= sh  # cy
+
+                # Update image scale
+                if "im_scales" in batch and torch.is_tensor(batch["im_scales"]):
+                    if batch["im_scales"].shape[-1] >= 2:
+                        batch["im_scales"][:, 0] *= sh
+                        batch["im_scales"][:, 1] *= sw
+                    else:
+                        batch["im_scales"] *= sh
+
+                # Scale projected center
+                if "gt_boxes3D" in batch and torch.is_tensor(batch["gt_boxes3D"]) and len(batch["gt_boxes3D"]):
+                    batch["gt_boxes3D"][:, 0] *= sw  # u
+                    batch["gt_boxes3D"][:, 1] *= sh  # v
+
+                # Scale 2D box
+                if batch["gt_2D"].numel() > 0 and batch["gt_2D"].ndim == 2 and batch["gt_2D"].shape[1] >= 3:
+                    batch["gt_2D"][:, [0, 2]] *= sw
+                    batch["gt_2D"][:, [1, 3]] *= sh
         return batch
 
     @staticmethod
@@ -386,7 +431,7 @@ class Detection3DTrainer(DetectionTrainer):
         )
 
     def plot_metrics(self):
-        """覆寫 Trainer 的 plot_metrics，調用自適應 3D 繪圖。"""
+        """Override plot_metrics"""
         plot_results_3d(file=self.csv, on_plot=self.on_plot)
 
     # ------------------------------------------------------------------
@@ -402,25 +447,17 @@ class Detection3DTrainer(DetectionTrainer):
         )
 
     def validate(self):
-        """支援自定義 val_period 驗證週期，大幅節省 3D 評估時間。"""
+        """Custom validation period"""
         if not self.args.val:
             loss = getattr(self, "loss", None)
             fallback_fitness = -self._metric_float(loss) if loss is not None else 0.0
             return {}, fallback_fitness
 
-        # 優先從 self.custom_val_period 或 data.yaml 中讀取 val_period (預設為 1，即每個 epoch 都驗證)
-        val_period = int(
-            getattr(self, "custom_val_period", None)
-            or self.data.get("val_period", 1)
-            or 1
-        )
-
         current_epoch = self.epoch + 1
         is_final_epoch = current_epoch >= self.epochs
 
-        # 若設定了週期，且當前不是週期倍數、也不是最後一個 epoch，則跳過本次驗證
-        if val_period > 1 and (current_epoch % val_period != 0) and not is_final_epoch:
-            LOGGER.info(f"Epoch {current_epoch}/{self.epochs}: 跳過 3D 評估 (val_period={val_period})")
+        if self.val_period > 1 and (current_epoch % self.val_period != 0) and not is_final_epoch:
+            LOGGER.info(f"Epoch {current_epoch}/{self.epochs}: Skip 3D eval (val_period={self.val_period})")
             last_fitness = getattr(self, "fitness", 0.0)
             last_metrics = getattr(self, "metrics", {})
             return last_metrics, last_fitness

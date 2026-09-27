@@ -11,13 +11,12 @@ import torch
 from pycocotools.coco import COCO
 
 from ultralytics.engine.validator import BaseValidator
-from ultralytics.utils import LOGGER, RANK, ops
+from ultralytics.utils import RANK, ops
 import cubercnn.vis.logperf as utils_logperf
-from collections import OrderedDict, abc
+from collections import OrderedDict
 import logging, sys
-from ultralytics.utils.cube_utils import get_cuboid_verts_faces
+from ultralytics.utils.cube_utils import get_cuboid_verts_faces, is_ignore
 
-# 關鍵：配置 cubercnn 日誌流，確保 logperf 產出的四張大表直接輸出至終端控制台
 _c_logger = logging.getLogger("cubercnn")
 _c_logger.setLevel(logging.INFO)
 if not any(isinstance(h, logging.StreamHandler) for h in _c_logger.handlers):
@@ -47,51 +46,50 @@ STAT_NAMES_3D = (
 )
 
 
-def is_ignore(anno: dict, filter_settings: dict, image_height: int) -> bool:
-    """判斷標註是否應被忽略，與官方 Cube R-CNN 規則完全一致。"""
-    if anno.get("behind_camera", False) or not bool(anno.get("valid3D", True)):
-        return True
+# def is_ignore(anno: dict, filter_settings: dict, image_height: int) -> bool:
+#     if anno.get("behind_camera", False) or not bool(anno.get("valid3D", True)):
+#         return True
 
-    dims = anno.get("dimensions", [0, 0, 0])
-    if dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0:
-        return True
-    center = anno.get("center_cam", [0, 0, 0])
-    if center[2] > filter_settings.get("max_depth", 512.0):
-        return True
-    if anno.get("lidar_pts", 1) == 0 or anno.get("segmentation_pts", 1) == 0:
-        return True
-    if anno.get("depth_error", 0) > 0.5:
-        return True
+#     dims = anno.get("dimensions", [0, 0, 0])
+#     if dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0:
+#         return True
+#     center = anno.get("center_cam", [0, 0, 0])
+#     if center[2] > filter_settings.get("max_depth", 512.0):
+#         return True
+#     if anno.get("lidar_pts", 1) == 0 or anno.get("segmentation_pts", 1) == 0:
+#         return True
+#     if anno.get("depth_error", 0) > 0.5:
+#         return True
 
-    tight = anno.get("bbox2D_tight")
-    trunc = anno.get("bbox2D_trunc")
-    proj = anno.get("bbox2D_proj")
+#     tight = anno.get("bbox2D_tight")
+#     trunc = anno.get("bbox2D_trunc")
+#     proj = anno.get("bbox2D_proj")
 
-    if filter_settings.get("modal_2D_boxes") and tight and tight[0] != -1:
-        bbox2D = [tight[0], tight[1], tight[2] - tight[0], tight[3] - tight[1]]
-    elif filter_settings.get("trunc_2D_boxes") and trunc and not all(v == -1 for v in trunc):
-        bbox2D = [trunc[0], trunc[1], trunc[2] - trunc[0], trunc[3] - trunc[1]]
-    elif proj and proj[0] != -1:
-        bbox2D = [proj[0], proj[1], proj[2] - proj[0], proj[3] - proj[1]]
-    else:
-        bbox2D = anno.get("bbox", [0, 0, 0, 0])
+#     if filter_settings.get("modal_2D_boxes") and tight and tight[0] != -1:
+#         bbox2D = [tight[0], tight[1], tight[2] - tight[0], tight[3] - tight[1]]
+#     elif filter_settings.get("trunc_2D_boxes") and trunc and not all(v == -1 for v in trunc):
+#         bbox2D = [trunc[0], trunc[1], trunc[2] - trunc[0], trunc[3] - trunc[1]]
+#     elif proj and proj[0] != -1:
+#         bbox2D = [proj[0], proj[1], proj[2] - proj[0], proj[3] - proj[1]]
+#     else:
+#         bbox2D = anno.get("bbox", [0, 0, 0, 0])
 
-    if bbox2D[3] <= filter_settings.get("min_height_thres", 0.0) * image_height:
-        return True
-    if bbox2D[3] >= filter_settings.get("max_height_thres", 1.5) * image_height:
-        return True
+#     if bbox2D[3] <= filter_settings.get("min_height_thres", 0.0) * image_height:
+#         return True
+#     if bbox2D[3] >= filter_settings.get("max_height_thres", 1.5) * image_height:
+#         return True
 
-    trunc_val = anno.get("truncation", -1)
-    if trunc_val >= 0 and trunc_val >= filter_settings.get("truncation_thres", 0.99):
-        return True
-    vis_val = anno.get("visibility", -1)
-    if vis_val >= 0 and vis_val <= filter_settings.get("visibility_thres", 0.01):
-        return True
+#     trunc_val = anno.get("truncation", -1)
+#     if trunc_val >= 0 and trunc_val >= filter_settings.get("truncation_thres", 0.99):
+#         return True
+#     vis_val = anno.get("visibility", -1)
+#     if vis_val >= 0 and vis_val <= filter_settings.get("visibility_thres", 0.01):
+#         return True
 
-    if "ignore_names" in filter_settings and anno.get("category_name") in filter_settings["ignore_names"]:
-        return True
+#     if "ignore_names" in filter_settings and anno.get("category_name") in filter_settings["ignore_names"]:
+#         return True
 
-    return False
+#     return False
 
 
 class Omni3DValidationGT(COCO):
