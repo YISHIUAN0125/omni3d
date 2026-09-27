@@ -13,17 +13,26 @@ import torch
 from typing import Any
 from ultralytics.utils import LOGGER
 
+def _valid_xyxy(box) -> bool:
+    if box is None or len(box) != 4:
+        return False
+    if any(v is None or v == -1 for v in box):
+        return False
+    x1, y1, x2, y2 = box
+    return x2 > x1 and y2 > y1
+
+
 def pick_2d_box(anno: dict, filter_settings: dict):
     tight = anno.get("bbox2D_tight")
-    if filter_settings.get("modal_2D_boxes") and tight and tight[0] != -1:
+    if filter_settings.get("modal_2D_boxes") and _valid_xyxy(tight):
         return _xyxy_to_xywh(tight)
 
     trunc = anno.get("bbox2D_trunc")
-    if filter_settings.get("trunc_2D_boxes") and trunc and not all(v == -1 for v in trunc):
+    if filter_settings.get("trunc_2D_boxes") and _valid_xyxy(trunc):
         return _xyxy_to_xywh(trunc)
 
     proj = anno.get("bbox2D_proj")
-    if proj and proj[0] != -1:
+    if _valid_xyxy(proj):
         return _xyxy_to_xywh(proj)
 
     return anno.get("bbox")
@@ -99,7 +108,7 @@ class Omni3DPriorDatasetAdapter:
                 item["category_name"] = cats.get(raw, str(raw)).lower()
                 item["category_id"] = int(id_map[raw])
                 image = self.imgs[item["image_id"]]
-                item["ignore"] = _official_ignore_equivalent(item, filter_settings, int(image["height"]))
+                item["ignore"] = is_ignore(item, filter_settings, int(image["height"]))
                 self._anns.append(item)
     def getAnnIds(self):
         return [a["id"] for a in self._anns]
