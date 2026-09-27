@@ -15,7 +15,7 @@ from ultralytics.utils.cube_utils import pick_2d_box, is_ignore
 from .augment import BaseTransform, Compose, Format, LetterBox
 from .base import BaseDataset
 
-CACHE_VERSION = "1.0.6"
+CACHE_VERSION = "1.0.7"
 
 DEFAULT_FILTER_SETTINGS = {
     "category_names": [],
