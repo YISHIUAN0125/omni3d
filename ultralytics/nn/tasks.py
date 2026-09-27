@@ -603,12 +603,10 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         head = self.model[-1]
-        # 關鍵：若最後一層是 Detect3D，直接返回 3D Loss
+        # Return 3D loss when Detect3D
         if isinstance(head, Detect3D):
             is_e2e = getattr(head, "end2end", False) and getattr(head, "one2one_cv2", None) is not None
             return E2EDetect3DLoss(self) if is_e2e else Detect3DLoss(self)
-        
-        # 原版 2D 邏輯保持不變
         return E2ELoss(self) if getattr(self.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss(self)
 
 class Detection3DModel(DetectionModel):
