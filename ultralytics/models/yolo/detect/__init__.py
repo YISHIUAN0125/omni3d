@@ -4,4 +4,7 @@ from .predict import DetectionPredictor
 from .train import DetectionTrainer
 from .val import DetectionValidator
 
-__all__ = "DetectionPredictor", "DetectionTrainer", "DetectionValidator"
+from .train_3d import Detection3DTrainer
+from .val_3d import Detection3DValidator
+
+__all__ = "DetectionPredictor", "DetectionTrainer", "DetectionValidator", "Detection3DTrainer", "Detection3DValidator"

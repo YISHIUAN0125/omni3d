@@ -1,0 +1,53 @@
+nc: 38
+end2end: true
+reg_max: 1
+
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C3k2, [256, false, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, false, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, true]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, true]]
+  - [-1, 1, SPPF, [1024, 5, 3, true]]
+  - [-1, 2, C2PSA, [1024]]
+
+head:
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, true]]
+
+  - [-1, 1, nn.Upsample, [null, 2, nearest]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, C3k2, [256, true]]
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, true]]
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 1, C3k2, [1024, true, 0.5, true]]
+
+  # Detect3D arguments:
+  # [nc, pose_type, z_type, use_conf, dims_priors_enabled,
+  #  virtual_depth, virtual_focal, disentangled_loss, chamfer_pose,
+  #  allocentric_pose, dims_priors_func, cluster_bins, priors,
+  #  reg_max, end2end]
+  #
+  # This baseline does not require priors:
+  # dims_priors_enabled=false, z_type=log, cluster_bins=0.
+  # virtual_depth remains enabled and is independent of priors.
+  - [[16, 19, 22], 1, Detect3D,
+     [nc, "'6d'", log, true, false, true, 512.0, true, true, true, null, 0, null, 1, true]]

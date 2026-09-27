@@ -602,19 +602,21 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        head = self.model[-1]
+        # Return 3D loss when Detect3D
+        if isinstance(head, Detect3D):
+            is_e2e = getattr(head, "end2end", False) and getattr(head, "one2one_cv2", None) is not None
+            return E2EDetect3DLoss(self) if is_e2e else Detect3DLoss(self)
         return E2ELoss(self) if getattr(self.model[-1], "one2one_cv2", None) is not None else v8DetectionLoss(self)
-
 
 class Detection3DModel(DetectionModel):
     def __init__(self, cfg="yolo26n.yaml", ch=3, nc=None, verbose=True):
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
-        return (
-            E2EDetect3DLoss(self)
-            if getattr(self.model[-1], "one2one_cv4", None) is not None
-            else Detect3DLoss(self)
-        )
+        head = self.model[-1]
+        is_e2e = getattr(head, "end2end", False) and getattr(head, "one2one_cv2", None) is not None
+        return E2EDetect3DLoss(self) if is_e2e else Detect3DLoss(self)
 
 
 class OBBModel(DetectionModel):

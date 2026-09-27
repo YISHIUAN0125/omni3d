@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates
-from detectron2.checkpoint import PeriodicCheckpointer
+# from detectron2.checkpoint import PeriodicCheckpointer
+from detectron2.engine.hooks import PeriodicCheckpointer
 from typing import Any
 
 class PeriodicCheckpointerOnlyOne(PeriodicCheckpointer):

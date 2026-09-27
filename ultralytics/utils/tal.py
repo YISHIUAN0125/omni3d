@@ -254,7 +254,8 @@ class TaskAlignedAssigner(nn.Module):
             (torch.Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
         """
         # (b, max_num_obj, topk)
-        topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=True)
+        topk = min(self.topk, metrics.shape[-1])
+        topk_metrics, topk_idxs = torch.topk(metrics, topk, dim=-1, largest=True)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
         # (b, max_num_obj, topk)
@@ -377,6 +378,104 @@ class TaskAlignedAssigner(nn.Module):
         # Find each grid serve which gt(index)
         target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
         return target_gt_idx, fg_mask, mask_pos
+
+class TaskAlignedAssigner3D(TaskAlignedAssigner):
+    def __init__(self, *args, gamma: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gamma = gamma
+        self._quality3d = None
+
+    def set_gamma(self, gamma: float) -> None:
+        if gamma < 0:
+            raise ValueError("Gamma must be non-negative")
+        self.gamma = float(gamma)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        pd_scores,
+        pd_bboxes,
+        anc_points,
+        gt_labels,
+        gt_bboxes,
+        mask_gt,
+        quality3d=None,
+    ):
+        if quality3d is None or self.gamma == 0.0:
+            return super().forward(
+                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            )
+        expected = (pd_scores.shape[0], gt_bboxes.shape[1], pd_scores.shape[1])
+        if tuple(quality3d.shape) != expected:
+            raise ValueError(
+                f"quality3d has shape {tuple(quality3d.shape)}, expected {expected}"
+            )
+        self.bs = pd_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.shape[1]
+        if self.n_max_boxes == 0:
+            return super().forward(
+                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            )
+        self._quality3d = quality3d.detach().clamp(min=self.eps, max=1.0)
+        try:
+            try:
+                return self._forward(
+                    pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+                )
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+
+            # OOM 回退修復：單張 retry 時同步切片 _quality3d
+            bs, n_max_boxes = self.bs, self.n_max_boxes
+            if not self._oom_warned:
+                LOGGER.warning(
+                    f"CUDA out of memory in TaskAlignedAssigner3D with batch_size={bs}; "
+                    "retrying assignment one image at a time on GPU."
+                )
+                self._oom_warned = True
+
+            last_gt_idx = (
+                mask_gt.squeeze(-1)
+                .bool()
+                .mul(torch.arange(1, n_max_boxes + 1, device=mask_gt.device))
+                .amax(1)
+                .clamp_(min=1)
+                .tolist()
+            )
+            self.bs = 1
+            results = None
+            full_quality = self._quality3d
+            try:
+                for i, self.n_max_boxes in enumerate(last_gt_idx):
+                    self._quality3d = full_quality[i : i + 1, : self.n_max_boxes]
+                    result = self._forward(
+                        pd_scores[i : i + 1],
+                        pd_bboxes[i : i + 1],
+                        anc_points,
+                        gt_labels[i : i + 1, : self.n_max_boxes],
+                        gt_bboxes[i : i + 1, : self.n_max_boxes],
+                        mask_gt[i : i + 1, : self.n_max_boxes],
+                    )
+                    if results is None:
+                        results = tuple(x.new_empty((bs, *x.shape[1:])) for x in result)
+                    for output, x in zip(results, result):
+                        output[i] = x[0]
+            finally:
+                self.bs, self.n_max_boxes = bs, n_max_boxes
+                self._quality3d = full_quality
+            return results
+        finally:
+            self._quality3d = None
+
+    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+        align_metric, overlaps = super().get_box_metrics(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt
+        )
+        if self._quality3d is not None:
+            quality = self._quality3d.to(device=align_metric.device, dtype=align_metric.dtype)
+            align_metric = align_metric * quality.pow(self.gamma)
+        return align_metric, overlaps
 
 
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
