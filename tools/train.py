@@ -5,7 +5,7 @@ def main():
     model = YOLO("configs/yolo26n-cube.yaml", task="detect3d").load("pretrained/yolo26n.pt")
     model.train(
         data='configs/omni3d_38_classes.yaml',
-        epochs=100,
+        epochs=200,
         batch=16,
         imgsz=640,
         workers=4,
