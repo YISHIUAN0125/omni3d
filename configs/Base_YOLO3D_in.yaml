@@ -39,6 +39,7 @@ MODEL:
   PIXEL_MEAN: [0.0, 0.0, 0.0]
   PIXEL_STD: [255.0, 255.0, 255.0]
   META_ARCHITECTURE: "YOLO3DWrapper"
+  PRETRAINED_WEIGHTS: "pretrained/yolo26m.pt"
   YOLO3D:
     ARCH: "configs/yolo26m-cube.yaml"
     IS_E2E: true

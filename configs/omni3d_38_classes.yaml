@@ -1,0 +1,85 @@
+# Omni3D data YAML template for Detection3DTrainer.
+# Replace every placeholder path, category ID, and class name.
+path: datasets/Omni3D
+image_root: datasets/
+
+train: SUNRGBD_train.json
+val: SUNRGBD_val.json
+test: SUNRGBD_test.json
+
+train_json:
+  - datasets/Omni3D/SUNRGBD_train.json
+  - datasets/Omni3D/SUNRGBD_val.json
+val_json:
+  - datasets/Omni3D/SUNRGBD_test.json
+test_json:
+  - datasets/Omni3D/SUNRGBD_test.json
+nc: 38
+channels: 3
+
+# Raw Omni3D category ID -> contiguous model class ID [0, 37].
+# Replace with the exact mapping used by your selected 38 categories.
+names:
+  - stationery
+  - sink
+  - table
+  - floor mat
+  - bottle
+  - bookcase
+  - bin
+  - blinds
+  - pillow
+  - bicycle
+  - refrigerator
+  - night stand
+  - chair
+  - sofa
+  - books
+  - oven
+  - towel
+  - cabinet
+  - window
+  - curtain
+  - bathtub
+  - laptop
+  - desk
+  - television
+  - clothes
+  - stove
+  - cup
+  - shelves
+  - box
+  - shoes
+  - mirror
+  - door
+  - picture
+  - lamp
+  - machine
+  - counter
+  - bed
+  - toilet
+
+filter_empty: true
+filter_settings:
+  truncation_thres: 0.75
+  visibility_thres: 0.25
+  min_height_thres: 0.05
+  max_height_thres: 1.50
+  modal_2D_boxes: false
+  trunc_2D_boxes: true
+  max_depth: 512.0
+  ignore_names: []
+
+
+val_filter_settings:
+  truncation_thres: 0.33333
+  visibility_thres: 0.33333
+  min_height_thres: 0.05
+  max_height_thres: 1.50
+  modal_2D_boxes: false
+  trunc_2D_boxes: true
+  max_depth: 512.0
+  ignore_names: []
+
+# Validator interface. Confirm whether Detect3D.postprocess emits xywh or xyxy.
+detect3d_pred_box_format: xywh

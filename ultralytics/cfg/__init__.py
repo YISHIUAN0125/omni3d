@@ -66,6 +66,7 @@ TASK2DATA = {
     "classify": "imagenet10",
     "pose": "coco8-pose.yaml",
     "obb": "dota8.yaml",
+    "detect3d": "configs/omni3d_38_classes.yaml"
 }
 TASK2CALIBRATIONDATA = {
     "detect": "coco128.yaml",
@@ -93,6 +94,7 @@ TASK2METRIC = {
     "classify": "metrics/accuracy_top1",
     "pose": "metrics/mAP50-95(P)",
     "obb": "metrics/mAP50-95(B)",
+    "detect3d": "metrics/AP3D"
 }
 
 ARGV = sys.argv or ["", ""]  # sometimes sys.argv = []

@@ -254,7 +254,8 @@ class TaskAlignedAssigner(nn.Module):
             (torch.Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
         """
         # (b, max_num_obj, topk)
-        topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=True)
+        topk = min(self.topk, metrics.shape[-1])
+        topk_metrics, topk_idxs = torch.topk(metrics, topk, dim=-1, largest=True)
         if topk_mask is None:
             topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
         # (b, max_num_obj, topk)
@@ -385,7 +386,6 @@ class TaskAlignedAssigner3D(TaskAlignedAssigner):
         self._quality3d = None
 
     def set_gamma(self, gamma: float) -> None:
-        """Update the 3D exponent, enabling an external warm-up schedule."""
         if gamma < 0:
             raise ValueError("Gamma must be non-negative")
         self.gamma = float(gamma)
@@ -418,9 +418,53 @@ class TaskAlignedAssigner3D(TaskAlignedAssigner):
             )
         self._quality3d = quality3d.detach().clamp(min=self.eps, max=1.0)
         try:
-            return self._forward(
-                pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+            try:
+                return self._forward(
+                    pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt
+                )
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+
+            # OOM 回退修復：單張 retry 時同步切片 _quality3d
+            bs, n_max_boxes = self.bs, self.n_max_boxes
+            if not self._oom_warned:
+                LOGGER.warning(
+                    f"CUDA out of memory in TaskAlignedAssigner3D with batch_size={bs}; "
+                    "retrying assignment one image at a time on GPU."
+                )
+                self._oom_warned = True
+
+            last_gt_idx = (
+                mask_gt.squeeze(-1)
+                .bool()
+                .mul(torch.arange(1, n_max_boxes + 1, device=mask_gt.device))
+                .amax(1)
+                .clamp_(min=1)
+                .tolist()
             )
+            self.bs = 1
+            results = None
+            full_quality = self._quality3d
+            try:
+                for i, self.n_max_boxes in enumerate(last_gt_idx):
+                    self._quality3d = full_quality[i : i + 1, : self.n_max_boxes]
+                    result = self._forward(
+                        pd_scores[i : i + 1],
+                        pd_bboxes[i : i + 1],
+                        anc_points,
+                        gt_labels[i : i + 1, : self.n_max_boxes],
+                        gt_bboxes[i : i + 1, : self.n_max_boxes],
+                        mask_gt[i : i + 1, : self.n_max_boxes],
+                    )
+                    if results is None:
+                        results = tuple(x.new_empty((bs, *x.shape[1:])) for x in result)
+                    for output, x in zip(results, result):
+                        output[i] = x[0]
+            finally:
+                self.bs, self.n_max_boxes = bs, n_max_boxes
+                self._quality3d = full_quality
+            return results
         finally:
             self._quality3d = None
 

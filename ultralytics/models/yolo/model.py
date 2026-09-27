@@ -114,8 +114,8 @@ class YOLO(Model):
             },
             "detect3d": {
                 "model": Detection3DModel,
-                "trainer": None,
-                "validator": None,
+                "trainer": yolo.detect.Detection3DTrainer,
+                "validator": yolo.detect.Detection3DValidator,
                 "predictor": None,
             },
             "segment": {

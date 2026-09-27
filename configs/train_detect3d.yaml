@@ -1,0 +1,52 @@
+# Training configuration for Detection3DTrainer.
+# Replace model/data/pretrained paths before running.
+
+task: detect
+mode: train
+model: configs/yolo26n-cube.yaml
+data: configs/omni3d_38_classes.yaml
+
+# Transfer compatible 2D weights into the YAML-built Detect3D model.
+# Keep the model field as the Detect3D YAML. Do not replace it with yolo26n.pt,
+# otherwise the checkpoint's standard Detect architecture may be constructed.
+pretrained: pretrained/yolo26n.pt
+resume: false
+
+# Core training
+epochs: 100
+batch: 8
+imgsz: 640
+workers: 4
+device: 0
+optimizer: auto
+seed: 0
+deterministic: true
+patience: 100
+close_mosaic: 0
+
+# Geometry-safe baseline
+multi_scale: 0.0
+rect: false
+mosaic: 0.0
+mixup: 0.0
+copy_paste: 0.0
+fliplr: 0.0
+flipud: 0.0
+
+# Runtime and precision
+amp: false
+compile: false
+cache: false
+plots: true
+save: true
+save_period: -1
+val: false
+
+# Logging/output
+project: runs/omni3d_detect3d
+name: yolo26n_detect3d_baseline
+exist_ok: false
+verbose: true
+
+# Keep the initial smoke test conservative. After one-batch and one-epoch tests,
+# AMP, augmentations, validation, priors, and CM3D can be enabled incrementally.

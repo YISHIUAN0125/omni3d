@@ -65,7 +65,6 @@ _EPOCH_SIZE_CACHE = {}
 
 def compute_epoch_size(cfg):
     """Calculate the number of samples per epoch according to the sampler type."""
-
     names = list(cfg.DATASETS.TRAIN)
     if not names:
         return 0.0
@@ -90,11 +89,11 @@ def compute_epoch_size(cfg):
                 dataset_dicts, repeat_thr
             )
             size = float(rf.sum().item())
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Unable to compute repeat factor（{e!r}, fallback to the size of datasets {n:.0f}.")
+        except Exception as e:
+            logger.warning(f"Unable to compute repeat factor ({e!r}), fallback to dataset size {n:.0f}.")
             size = n
 
-    logger.info(f"[epoch size] sampler={sampler}, datasets size={n:.0f}, avalible epoch samples≈{size:.1f}")
+    logger.info(f"[epoch size] sampler={sampler}, datasets size={n:.0f}, available epoch samples≈{size:.1f}")
     _EPOCH_SIZE_CACHE[key] = size
     return size
 
@@ -112,14 +111,14 @@ def _rescale_lr_schedule(cfg, old_max, new_max):
             if 0 < v < new_max and (not scaled or v > scaled[-1]):
                 scaled.append(v)
             else:
-                logger.warning(f"LR STEP {s} scaling to {v} needs to be incremented and < MAX_ITER={new_max}), and has been discarded.")
+                logger.warning(f"LR STEP {s} scaling to {v} needs to be incremented and < MAX_ITER={new_max}, discarded.")
         cfg.SOLVER.STEPS = tuple(scaled)
         logger.info(f"[LR rescale] MAX_ITER {old_max}->{new_max}, STEPS {steps} -> {tuple(scaled)}")
 
     warmup = cfg.SOLVER.WARMUP_ITERS
     first = cfg.SOLVER.STEPS[0] if len(cfg.SOLVER.STEPS) > 0 else new_max
     if warmup >= first:
-        logger.warning(f"WARMUP_ITERS={warmup} >= firsr decay point/MAX_ITER={first}, please check warmup setting.")
+        logger.warning(f"WARMUP_ITERS={warmup} >= first decay point/MAX_ITER={first}, please check warmup setting.")
 
 def resolve_epoch_iter_config(cfg, mode: str = "iter") -> int:
     iters_per_epoch = compute_iters_per_epoch(cfg)
@@ -150,12 +149,11 @@ def resolve_epoch_iter_config(cfg, mode: str = "iter") -> int:
 # Criterion update hook
 # -----------------------------------------------------------
 def _get_criterion(model):
-    """
-    Unpack DDP and get criterion：
-    model.criterion / model.module.criterion / model.(module.)model.criterion
-    """
+    """Unpack DDP model and extract criterion."""
     raw_model = model.module if hasattr(model, "module") else model
     if hasattr(raw_model, "criterion"):
+        return raw_model.criterion
+    if hasattr(raw_model, "yolo_model") and hasattr(raw_model, "criterion"):
         return raw_model.criterion
     if hasattr(raw_model, "model") and hasattr(raw_model.model, "criterion"):
         return raw_model.model.criterion
@@ -201,7 +199,7 @@ class CriterionScheduler:
 
 class CriterionUpdateHook(HookBase):
     """Dynamic update criterion: TAL assigner o2m o2o weights etc."""
-    def __init__(self, iters_per_epoch: int, mode: str = "step", epoch_type: str = "auto"):
+    def __init__(self, iters_per_epoch: int, mode: str = "epoch", epoch_type: str = "auto"):
         assert mode in ("step", "epoch"), f"CRITERION_UPDATE_MODE need to be 'step' or 'epoch', got {mode!r}"
         self.iters_per_epoch = iters_per_epoch
         self.mode = mode
@@ -215,15 +213,15 @@ class CriterionUpdateHook(HookBase):
         criterion = _get_criterion(self.trainer.train_model)
         if criterion is None or not hasattr(criterion, "update"):
             if comm.is_main_process():
-                logger.warning("[CriterionUpdateHook] Can't find criterion.update(), ignore this when train cubercnn or any model based on detectron2")
+                logger.warning("[CriterionUpdateHook] Can't find criterion.update(), ignore if not using YOLO3D")
             return
 
         self._updater = CriterionScheduler(criterion, self.iters_per_epoch, self.epoch_type)
-        cur_step = self.trainer.iter  # 已完成步數（fresh=0，resume=start_iter）
+        cur_step = self.trainer.iter
         self._sync(cur_step)
         if comm.is_main_process():
             logger.info(
-                f"[Criterion Sync] step {cur_step} (epoch {cur_step / self.iters_per_epoch:.2f}),"
+                f"[Criterion Sync] step {cur_step} (epoch {cur_step / self.iters_per_epoch:.2f}), "
                 f"mode={self.mode}, update param={sorted(self._updater.names) or f'positional×{self._updater.n_positional}'}"
             )
 
@@ -238,8 +236,9 @@ class CriterionUpdateHook(HookBase):
         if is_epoch_boundary and comm.is_main_process():
             logger.info(f"[Epoch Update] Epoch {cur_step // self.iters_per_epoch} finished (step {cur_step})")
 
+
 # -----------------------------------------------------------
-# Build model
+# Build model & helpers
 # -----------------------------------------------------------
 def build_model_for_cfg(cfg, priors=None):
     if cfg.MODEL.META_ARCHITECTURE == "YOLO3DWrapper":
@@ -251,19 +250,10 @@ def build_model_for_cfg(cfg, priors=None):
     return model
 
 def _gather_loss_keys(loss_dict):
-    """Take the union of the loss keys for all ranks 
-    (this only needs to be called once in the first step, 
-    but all ranks need to be called simultaneously)."""
     gathered = comm.all_gather(sorted(loss_dict.keys()))
     return sorted(set().union(*gathered))
 
 def _all_reduce_mean_dict(loss_dict, keys):
-    """
-    Returning (total, per_key_dict), all ranks receive a consistent average.
-    The vector length is fixed at 1 + len(keys). Missing keys in a rank are padded with 0s,
-    to avoid all_reduce hangs caused by different tensor lengths across ranks.
-    Difference judgment uses the perpetually existing scalar `total`.
-    """
     ref = next(iter(loss_dict.values()))
     zero = torch.zeros((), device=ref.device)
     total = sum(v.detach().float().sum() for v in loss_dict.values())
@@ -290,19 +280,13 @@ def _log_bad_grad_name(model):
             logger.warning(f"Non-finite gradient in {name}")
             return
 
-
 _DDP_PATCHED = False
 
 def _maybe_patch_ddp_find_unused(cfg):
-    """
-    If cfg.MODEL.DDP_FIND_UNUSED is True (default is False), 
-    the DefaultTrainer will include find_unused_parameters=True 
-    when creating a DDP. It will only patch once.
-    """
     global _DDP_PATCHED
     if _DDP_PATCHED:
         return
-    if comm.get_world_size() > 1 and getattr(cfg.MODEL, "DDP_FIND_UNUSED", False):
+    if comm.get_world_size() > 1 and getattr(cfg.MODEL, "DDP_FIND_UNUSED", True):
         d2_defaults.create_ddp_model = functools.partial(
             d2_defaults.create_ddp_model, find_unused_parameters=True
         )
@@ -311,7 +295,7 @@ def _maybe_patch_ddp_find_unused(cfg):
 
 
 # -----------------------------------------------------------
-# Build model
+# Evaluation
 # -----------------------------------------------------------
 def do_test(cfg, model, iteration="final"):
     filter_settings = data.get_filter_settings_from_cfg(cfg)
@@ -321,7 +305,7 @@ def do_test(cfg, model, iteration="final"):
     filter_settings["max_depth"] = 1e8
 
     dataset_names_test = cfg.DATASETS.TEST
-    only_2d = cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D == 0.0
+    only_2d = cfg.MODEL.ROI_CUBE_HEAD.LOSS_W_3D == 0.0 if hasattr(cfg.MODEL, "ROI_CUBE_HEAD") else False
     output_folder = os.path.join(cfg.OUTPUT_DIR, "inference", f"iter_{iteration}")
 
     eval_helper = Omni3DEvaluationHelper(
@@ -378,6 +362,7 @@ class PeriodicEvalHook(HookBase):
         self._do_test(self.trainer.cfg, self.trainer.train_model, iteration=cur_step)
         comm.synchronize()
 
+
 # -----------------------------------------------------------
 # Trainer
 # -----------------------------------------------------------
@@ -389,7 +374,6 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
 
         self.iters_per_epoch = compute_iters_per_epoch(cfg)
 
-        # Loss of explosion-proof switches and statistical status
         self.tolerance = 4.0
         self.gamma = 0.02
         self.recent_loss = None
@@ -398,7 +382,7 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
         self._loss_keys = None
 
         if getattr(getattr(cfg.SOLVER, "AMP", None), "ENABLED", False):
-            logger.warning("Custom run_step doesn't AMP, please turn off SOLVER.AMP.ENABLED")
+            logger.warning("Custom run_step doesn't use AMP, please turn off SOLVER.AMP.ENABLED")
 
         _maybe_patch_ddp_find_unused(cfg)
 
@@ -412,7 +396,6 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
     def train_model(self):
         return self._core.model
 
-    # ---- builders ----
     def build_model(self, cfg):
         return build_model_for_cfg(cfg, priors=self.priors)
 
@@ -432,7 +415,7 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
         return build_detection_train_loader(cfg, mapper=data_mapper, dataset_id_to_src=self.dataset_id_to_src)
 
     def build_hooks(self):
-        update_mode = getattr(self.cfg.MODEL.YOLO3D, "CRITERION_UPDATE_MODE", "step")
+        update_mode = getattr(self.cfg.MODEL.YOLO3D, "CRITERION_UPDATE_MODE", "epoch")
         epoch_type = getattr(self.cfg.MODEL.YOLO3D, "CRITERION_EPOCH_TYPE", "auto")
 
         new_hooks = []
@@ -487,8 +470,7 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
         )
         if diverging:
             logger.warning(
-                f"Skipping gradient update due to abnormal loss {losses_reduced:.4f} "
-                f"vs. rolling mean {self.recent_loss}"
+                f"Abnormal loss {losses_reduced:.4f} vs. rolling mean {self.recent_loss}, will skip step."
             )
         elif finite:
             self.recent_loss = (
@@ -496,21 +478,31 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
                 else self.recent_loss * (1 - self.gamma) + losses_reduced * self.gamma
             )
 
-        optimizer.zero_grad()
-        losses.backward()
-
-        # Grad NaN / Inf check
-        if stabilize > 0 and not diverging and _has_bad_grad(model):
-            diverging = True
-            if comm.is_main_process():
-                _log_bad_grad_name(model)
-            logger.warning("Gradient explosion detected, skipping update.")
-
-        # Multi GPU sync
+        # 跨卡同步發散旗標，確保所有 Rank 同步跳過或更新
         flag = torch.tensor(float(diverging), device=losses.device)
         if comm.get_world_size() > 1:
             dist.all_reduce(flag, op=dist.ReduceOp.MAX)
         diverging = flag.item() > 0
+
+        optimizer.zero_grad()
+
+        if diverging:
+            # 遇到異常時，Backward 0 權重的 loss 以保持 DDP gradient bucket 同步而不修改權重
+            (losses * 0.0).backward()
+            optimizer.zero_grad()
+            self.iterations_explode += 1
+        else:
+            losses.backward()
+            # 檢查梯度是否包含 NaN/Inf
+            if stabilize > 0 and _has_bad_grad(model):
+                if comm.is_main_process():
+                    _log_bad_grad_name(model)
+                logger.warning("Gradient explosion detected, zeroing grad for this step.")
+                optimizer.zero_grad()
+                self.iterations_explode += 1
+            else:
+                optimizer.step()
+                self.iterations_success += 1
 
         metrics = {"data_time": data_time}
         if finite:
@@ -518,14 +510,7 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
             metrics["total_loss"] = losses_reduced
         storage.put_scalars(**metrics)
 
-        if diverging:
-            optimizer.zero_grad()
-            self.iterations_explode += 1
-        else:
-            optimizer.step()
-            self.iterations_success += 1
-
-        # Breaker: If the counts are consistent across all ranks, a circuit breaker will be triggered synchronously.
+        # 發散熔斷器
         total_iters = self.iterations_success + self.iterations_explode
         if (
             stabilize > 0
@@ -536,8 +521,9 @@ class CubeYOLOUnifiedTrainer(DefaultTrainer):
                 f"Model diverged: Discarded {self.iterations_explode}/{total_iters} steps (>= {stabilize})"
             )
 
+
 # -----------------------------------------------------------
-# Data preporcess
+# Setup & Main
 # -----------------------------------------------------------
 def _resolve_config_path(args) -> str:
     config_file = args.config_file
@@ -570,9 +556,7 @@ def setup(args):
 def _register_model_metadata_for_eval(args, cfg):
     category_path = os.path.join(cfg.OUTPUT_DIR, "category_meta.json")
     if not os.path.isfile(category_path):
-        raise FileNotFoundError(
-            f"eval-only can't find category_meta.json：{category_path}。"
-        )
+        raise FileNotFoundError(f"eval-only can't find category_meta.json: {category_path}")
 
     with open(category_path, "r") as f:
         metadata = json.load(f)
@@ -626,11 +610,8 @@ def main(args):
         resolve_epoch_iter_config(cfg, mode=getattr(cfg.MODEL.YOLO3D, "TIME_UNIT", "iter"))
         cfg.freeze()
 
-    # 發散重啟迴圈
     base_seed = cfg.SEED
     for attempt in range(1, MAX_TRAINING_ATTEMPTS + 1):
-        # 重試時換 seed（所有 rank 的 attempt 序列一致，seed 也一致）。
-        # SEED < 0 代表隨機，不需處理。實際是否改變資料順序取決於 sampler 是否讀 cfg.SEED。
         if attempt > 1 and base_seed >= 0:
             cfg.defrost()
             cfg.SEED = base_seed + attempt
@@ -642,7 +623,6 @@ def main(args):
             dataset_id_to_unknown_cats=dataset_id_to_unknown_cats,
             dataset_id_to_src=dataset_id_to_src,
         )
-        # 第二次起強制從最近的 checkpoint 續訓
         trainer.resume_or_load(resume=(args.resume or attempt > 1))
 
         diverged = False

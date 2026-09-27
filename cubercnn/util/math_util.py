@@ -976,3 +976,88 @@ def scaled_sigmoid(vals, min=0.0, max=1.0):
         max (Tensor or float): the maximum value to scale to.
     """
     return min + (max-min)*torch.sigmoid(vals)
+
+
+def get_cuboid_verts_faces_(box3d=None, R=None):
+    """
+    Computes vertices and faces from a 3D cuboid representation without CUDA advanced indexing.
+    Args:
+        box3d (flexible): [[X Y Z W H L]]
+        R (flexible): [np.array(3x3)]
+    Returns:
+        verts: the 3D vertices of the cuboid in camera space [N, 8, 3]
+        faces: the vertex indices per face [N, 12, 3]
+    """
+    if box3d is None:
+        box3d = [0, 0, 0, 1, 1, 1]
+
+    # 確保型態與設備一致
+    box3d = to_float_tensor(box3d)
+    if R is not None:
+        R = to_float_tensor(R)
+
+    squeeze = len(box3d.shape) == 1
+    if squeeze:    
+        box3d = box3d.unsqueeze(0)
+        if R is not None:
+            R = R.unsqueeze(0)
+    
+    n = len(box3d)
+    device = box3d.device
+
+    centers = box3d[:, :3]
+    w = box3d[:, 3]
+    h = box3d[:, 4]
+    l = box3d[:, 5]
+
+    # 採用純張量堆疊，嚴格對齊原版 8 個頂點的幾何定義，徹底避開 CUDA Indexing.cu 崩潰
+    # v0: [-l/2, -h/2, -w/2]
+    # v1: [ l/2, -h/2, -w/2]
+    # v2: [ l/2,  h/2, -w/2]
+    # v3: [-l/2,  h/2, -w/2]
+    # v4: [-l/2, -h/2,  w/2]
+    # v5: [ l/2, -h/2,  w/2]
+    # v6: [ l/2,  h/2,  w/2]
+    # v7: [-l/2,  h/2,  w/2]
+    x_local = torch.stack([-l, l, l, -l, -l, l, l, -l], dim=1) * 0.5
+    y_local = torch.stack([-h, -h, h, h, -h, -h, h, h], dim=1) * 0.5
+    z_local = torch.stack([-w, -w, -w, -w, w, w, w, w], dim=1) * 0.5
+
+    # [n, 3, 8]
+    verts = torch.stack([x_local, y_local, z_local], dim=1)
+
+    if R is not None:
+        verts = R @ verts
+
+    # 平移至相機坐標系中心
+    verts[:, 0:1, :] += centers[:, 0:1, None]
+    verts[:, 1:2, :] += centers[:, 1:2, None]
+    verts[:, 2:3, :] += centers[:, 2:3, None]
+
+    verts = verts.transpose(1, 2)  # [n, 8, 3]
+
+    faces = torch.tensor([
+        [0, 1, 2], # front TR
+        [2, 3, 0], # front BL
+
+        [1, 5, 6], # right TR
+        [6, 2, 1], # right BL
+
+        [4, 0, 3], # left TR
+        [3, 7, 4], # left BL
+
+        [5, 4, 7], # back TR
+        [7, 6, 5], # back BL
+
+        [4, 5, 1], # top TR
+        [1, 0, 4], # top BL
+
+        [3, 2, 6], # bottom TR
+        [6, 7, 3], # bottom BL
+    ], dtype=torch.float32, device=device).unsqueeze(0).repeat([n, 1, 1])
+
+    if squeeze:
+        verts = verts.squeeze(0)
+        faces = faces.squeeze(0)
+
+    return verts, faces

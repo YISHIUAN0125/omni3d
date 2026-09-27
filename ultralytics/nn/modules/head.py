@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -295,60 +297,33 @@ class Detect(nn.Module):
 # Detect3D
 # -------------------------------------------------
 class SpatialCubeBranch(nn.Module):
-    """Dense spatial Cube regression branch.
-
-    The effective receptive field is 3x3: one shared 3x3 geometry stem,
-    followed by task-specific 1x1 projections and 1x1 prediction layers.
-    Batch Normalization is applied via standard Ultralytics Conv blocks.
-    """
+    """Dense spatial Cube parameter head shared across P3-P5 levels."""
 
     def __init__(self, channels: int, pose_dim: int, z_dim: int, use_conf: bool):
         super().__init__()
-
-        # Shared 3x3 stem: Conv2d(3x3) -> BatchNorm2d -> SiLU
-        self.spatial = Conv(channels, channels, k=3, s=1, p=1, act=True)
-
-        def task_head(out_channels: int) -> nn.Sequential:
-            return nn.Sequential(
-                Conv(channels, channels, k=1, s=1, act=True),
-                nn.Conv2d(channels, out_channels, 1, bias=True),
-            )
-
-        self.deltas = task_head(2)
-        self.dims = task_head(3)
-        self.pose = task_head(pose_dim)
-        self.z = task_head(z_dim)
-        self.uncert = task_head(1) if use_conf else None
-        self.reset_parameters()
-
-    @staticmethod
-    def _init_output(head: nn.Sequential, bias: float = 0.0) -> None:
-        output = head[-1]
-        nn.init.normal_(output.weight, std=0.001)
-        nn.init.constant_(output.bias, bias)
-
-    def reset_parameters(self) -> None:
-        self._init_output(self.deltas)
-        self._init_output(self.dims)
-        self._init_output(self.pose)
-        self._init_output(self.z)
-        if self.uncert is not None:
-            self._init_output(self.uncert, bias=5.0)
+        self.stem = nn.Sequential(
+            Conv(channels, channels, k=3, s=1, act=True),
+            Conv(channels, channels, k=3, s=1, act=True),
+        )
+        self.heads = nn.ModuleDict(
+            {
+                "deltas": nn.Conv2d(channels, 2, kernel_size=1),
+                "dims": nn.Conv2d(channels, 3, kernel_size=1),
+                "pose": nn.Conv2d(channels, pose_dim, kernel_size=1),
+                "z": nn.Conv2d(channels, z_dim, kernel_size=1),
+            }
+        )
+        if use_conf:
+            self.heads["uncert"] = nn.Conv2d(channels, 1, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        x = self.spatial(x)
-        out = {
-            "deltas": self.deltas(x),
-            "dims": self.dims(x),
-            "pose": self.pose(x),
-            "z": self.z(x),
-        }
-        if self.uncert is not None:
-            out["uncert"] = self.uncert(x).clamp(min=0.01)
-        return out
+        x = self.stem(x)
+        return {name: layer(x) for name, layer in self.heads.items()}
 
 
 class Detect3D(Detect):
+    """Ultralytics dense 2D/3D detection head supporting Cube R-CNN supervision and priors."""
+
     def __init__(
         self,
         nc: int = 80,
@@ -361,83 +336,75 @@ class Detect3D(Detect):
         disentangled_loss: bool = False,
         chamfer_pose: bool = False,
         allocentric_pose: bool = True,
-        dims_priors_func=None,
+        dims_priors_func: str | None = "exp",
         cluster_bins: int = 0,
-        priors=None,
+        priors: Mapping[str, Any] | None = None,
         reg_max: int = 16,
         end2end: bool = True,
         ch: tuple = (),
     ):
         super().__init__(nc=nc, reg_max=reg_max, end2end=end2end, ch=ch)
-        self.end2end = end2end
+
+        if not ch:
+            raise ValueError("Detect3D requires non-empty input channels 'ch'.")
+        if pose_type not in {"6d", "quaternion", "euler"}:
+            raise ValueError(f"Unsupported pose_type={pose_type!r}")
+        if z_type not in {"direct", "sigmoid", "log", "clusters"}:
+            raise ValueError(f"Unsupported z_type={z_type!r}")
+        if dims_priors_func not in {None, "exp", "sigmoid"}:
+            raise ValueError("dims_priors_func must be 'exp', 'sigmoid', or None")
+
+        self.end2end = bool(end2end)
         self.pose_type = pose_type
-        self.use_conf = use_conf
-        self.dims_priors_enabled = dims_priors_enabled
-        self.virtual_depth = virtual_depth
-        self.virtual_focal = virtual_focal
         self.z_type = z_type
-        self.disentangled_loss = disentangled_loss
-        self.chamfer_pose = chamfer_pose
-        self.allocentric_pose = allocentric_pose
-        self.dims_priors_func = dims_priors_func
-        self.cluster_bins = cluster_bins
-        self.priors = priors
+        self.use_conf = bool(use_conf)
+        self.dims_priors_enabled = bool(dims_priors_enabled)
+        self.virtual_depth = bool(virtual_depth)
+        self.virtual_focal = float(virtual_focal)
+        self.disentangled_loss = bool(disentangled_loss)
+        self.chamfer_pose = bool(chamfer_pose)
+        self.allocentric_pose = bool(allocentric_pose)
+        self.dims_priors_func = dims_priors_func or "exp"
+        self.cluster_bins = int(cluster_bins)
+        self.priors: dict[str, Any] | None = None
+
         pose_dim = {"6d": 6, "quaternion": 4, "euler": 3}[pose_type]
+        z_dim = max(self.cluster_bins, 1)
 
-        if self.dims_priors_enabled and priors is not None and "priors_dims_per_cat" in priors:
-            priors_dims = torch.as_tensor(priors["priors_dims_per_cat"], dtype=torch.float32).unsqueeze(0)
-        else:
-            priors_dims = torch.ones(1, self.nc, 2, 3)
-        self.register_buffer("priors_dims_per_cat", priors_dims, persistent=True)
-
-        # 2. 深度尺度先驗 (Z Scales)
-        if self.cluster_bins > 1 and priors is not None and "priors_bins" in priors:
-            priors_z_scales = torch.stack([
-                torch.as_tensor(prior[1], dtype=torch.float32) for prior in priors["priors_bins"]
-            ])
-        else:
-            priors_z_scales = torch.ones(self.nc, max(self.cluster_bins, 1))
-        self.register_buffer("priors_z_scales", priors_z_scales, persistent=True)
-
-        # 3. 深度統計量先驗 (Z Stats)
-        if self.z_type == "clusters":
-            assert self.cluster_bins > 1, "To use z_type of priors, there must be more than 1 cluster bin"
-            if priors is None or "priors_bins" not in priors:
-                priors_z_stats = torch.ones(self.nc, self.cluster_bins, 2)
-            else:
-                priors_z_stats = torch.cat([
-                    torch.as_tensor(prior[2], dtype=torch.float32).unsqueeze(0) for prior in priors["priors_bins"]
-                ])
-            self.register_buffer("priors_z_stats", priors_z_stats, persistent=True)
-
-        # Spatial Dense Cube head.
-        c4 = min(256, max(128, ch[0] // 2))
-        self.cube_channels = c4
-        
-        # 使用 conv.py 中的 Conv 模組取代原本的 Conv2d + GroupNorm + SiLU
-        self.cv4 = nn.ModuleList(Conv(x, c4, k=1, s=1, act=True) for x in ch)
-        self.cube_branch = SpatialCubeBranch(
-            channels=c4,
-            pose_dim=pose_dim,
-            z_dim=max(cluster_bins, 1),
-            use_conf=self.use_conf,
+        self.register_buffer(
+            "priors_dims_per_cat",
+            torch.ones(1, self.nc, 2, 3, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "priors_z_scales",
+            torch.ones(self.nc, z_dim, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "priors_z_stats",
+            torch.ones(self.nc, z_dim, 2, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "priors_initialized",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
         )
 
-        # O2O keeps private parameters and receives detached neck features
+        if priors is not None:
+            self.set_priors(priors)
+
+        c4 = min(256, max(128, ch[0] // 2))
+        self.cube_channels = c4
+        self.cv4 = nn.ModuleList(Conv(x, c4, k=1, s=1, act=True) for x in ch)
+        self.cube_branch = SpatialCubeBranch(c4, pose_dim, z_dim, self.use_conf)
+
         self.one2one_cv4 = copy.deepcopy(self.cv4)
         self.one2one_cube_branch = copy.deepcopy(self.cube_branch)
 
-    @property
-    def cube_one2many(self) -> dict[str, nn.Module]:
-        return {"cube_branch": self.cube_branch}
-
-    @property
-    def cube_one2one(self) -> dict[str, nn.Module]:
-        return {"cube_branch": self.one2one_cube_branch}
-
     @staticmethod
     def _flatten_cube_map(x: torch.Tensor) -> torch.Tensor:
-        """Convert (B, D, H, W) to anchor-major (B, H*W, D)."""
         return x.flatten(2).transpose(1, 2).contiguous()
 
     def forward_cube(
@@ -446,7 +413,6 @@ class Detect3D(Detect):
         adapters: nn.ModuleList,
         cube_branch: SpatialCubeBranch,
     ) -> dict[str, torch.Tensor]:
-        """Run full dense 3D regression on all P3-P5 locations."""
         per_task: dict[str, list[torch.Tensor]] = {}
         for level, feat in enumerate(x):
             level_pred = cube_branch(adapters[level](feat))
@@ -458,28 +424,48 @@ class Detect3D(Detect):
             outputs["uncert"] = outputs["uncert"].squeeze(-1)
         return outputs
 
-    def set_priors(self, priors: dict):
-        if priors is None:
-            return
-        self.priors = priors
-        dev = self.priors_dims_per_cat.device
-        dt = self.priors_dims_per_cat.dtype
+    @staticmethod
+    def _copy_prior_buffer(buffer: torch.Tensor, value: Any, name: str) -> None:
+        tensor = torch.as_tensor(value, dtype=buffer.dtype, device=buffer.device)
+        if tuple(tensor.shape) != tuple(buffer.shape):
+            raise ValueError(
+                f"{name} shape mismatch: expected {tuple(buffer.shape)}, got {tuple(tensor.shape)}"
+            )
+        buffer.copy_(tensor)
 
-        if "priors_dims_per_cat" in priors:
-            dims = torch.as_tensor(priors["priors_dims_per_cat"], dtype=dt, device=dev).unsqueeze(0)
-            self.priors_dims_per_cat.copy_(dims)
+    def disable_priors(self) -> None:
+        """當未提供或未找到先驗時呼叫，平滑退回無先驗模式。"""
+        self.dims_priors_enabled = False
+        if self.z_type == "clusters":
+            LOGGER.warning("[Detect3D] z_type='clusters' 需要先驗支援，已降級為 z_type='direct'")
+            self.z_type = "direct"
+        self.cluster_bins = 0
+        self.priors_initialized.fill_(False)
 
-        if "priors_bins" in priors and self.cluster_bins > 1:
-            z_scales = torch.stack([
-                torch.as_tensor(prior[1], dtype=dt, device=dev) for prior in priors["priors_bins"]
-            ])
-            self.priors_z_scales.copy_(z_scales)
+    def set_priors(self, priors: Mapping[str, Any]) -> "Detect3D":
+        if not isinstance(priors, Mapping):
+            raise TypeError("set_priors() expects a dict/Mapping.")
 
-            if self.z_type == "clusters":
-                z_stats = torch.cat([
-                    torch.as_tensor(prior[2], dtype=dt, device=dev).unsqueeze(0) for prior in priors["priors_bins"]
-                ])
-                self.priors_z_stats.copy_(z_stats)
+        if self.dims_priors_enabled and "priors_dims_per_cat" in priors:
+            dims = torch.as_tensor(priors["priors_dims_per_cat"]).unsqueeze(0)
+            self._copy_prior_buffer(self.priors_dims_per_cat, dims, "priors_dims_per_cat")
+
+        if self.cluster_bins > 1 and "priors_bins" in priors:
+            bins = priors["priors_bins"]
+            z_scales = torch.stack([torch.as_tensor(item[1]) for item in bins])
+            z_stats = torch.cat([torch.as_tensor(item[2]).unsqueeze(0) for item in bins], dim=0)
+            self._copy_prior_buffer(self.priors_z_scales, z_scales, "priors_z_scales")
+            self._copy_prior_buffer(self.priors_z_stats, z_stats, "priors_z_stats")
+
+        self.priors = dict(priors)
+        self.priors_initialized.fill_(True)
+        return self
+
+    def validate_priors_ready(self) -> None:
+        priors_required = self.dims_priors_enabled or (self.z_type == "clusters" and self.cluster_bins > 1)
+        if priors_required and not bool(self.priors_initialized.item()):
+            LOGGER.warning("[Detect3D] 先驗未初始化，已自動切換為無先驗回歸模式。")
+            self.disable_priors()
 
     def decode_cube(
         self,
@@ -490,84 +476,98 @@ class Detect3D(Detect):
         focal_lengths: torch.Tensor,
         im_scales_orig: torch.Tensor,
         im_scales: torch.Tensor,
-    ):
+    ) -> dict[str, torch.Tensor]:
+        self.validate_priors_ready()
+
         n = box_classes.shape[0]
         fg_inds = torch.arange(n, device=box_classes.device)
-
-        src_w = (src_boxes[:, 2] - src_boxes[:, 0]).clamp(min=1.0)
-        src_h = (src_boxes[:, 3] - src_boxes[:, 1]).clamp(min=1.0)
+        src_w = (src_boxes[:, 2] - src_boxes[:, 0]).clamp_min(1.0)
+        src_h = (src_boxes[:, 3] - src_boxes[:, 1]).clamp_min(1.0)
         src_cx = (src_boxes[:, 0] + src_boxes[:, 2]) * 0.5
         src_cy = (src_boxes[:, 1] + src_boxes[:, 3]) * 0.5
 
         cube_x = src_cx + src_w * cube_preds["deltas"][:, 0]
         cube_y = src_cy + src_h * cube_preds["deltas"][:, 1]
-        cube_xy = torch.stack([cube_x, cube_y], dim=1)
+        cube_xy = torch.stack((cube_x, cube_y), dim=1)
 
-        dims_norm = cube_preds["dims"].clamp(min=-5.0, max=5.0)
-        if self.dims_priors_enabled:
+        raw_dims = cube_preds["dims"]
+        if self.dims_priors_enabled and bool(self.priors_initialized.item()):
             prior_dims = self.priors_dims_per_cat.detach()[0, box_classes]
-            prior_mean = prior_dims[:, 0, :]
-            prior_std = prior_dims[:, 1, :]
-
-            dims_func = getattr(self, "dims_priors_func", None)
-            if dims_func == "sigmoid":
-                prior_min = (prior_mean - 3 * prior_std).clamp(min=0.0)
-                prior_max = (prior_mean + 3 * prior_std)
-                cube_dims = cubeutil.scaled_sigmoid(cube_preds["dims"], min=prior_min, max=prior_max)
+            prior_mean = prior_dims[:, 0]
+            prior_std = prior_dims[:, 1]
+            if self.dims_priors_func == "sigmoid":
+                lower = (prior_mean - 3 * prior_std).clamp_min(0.0)
+                upper = prior_mean + 3 * prior_std
+                cube_dims = cubeutil.scaled_sigmoid(raw_dims, min=lower, max=upper)
             else:
-                cube_dims = torch.exp(cube_preds["dims"].clamp(max=5)) * prior_mean
+                cube_dims = torch.exp(raw_dims.clamp(-5, 5)) * prior_mean
         else:
-            cube_dims = torch.exp(dims_norm)
+            cube_dims = torch.exp(raw_dims.clamp(-5, 5))
 
+        raw_pose = cube_preds["pose"]
         if self.pose_type == "6d":
-            cube_pose = rotation_6d_to_matrix(cube_preds["pose"])
+            cube_pose = rotation_6d_to_matrix(raw_pose)
         elif self.pose_type == "quaternion":
-            q = cube_preds["pose"]
-            q = q / _copysign(torch.sqrt((q * q).sum(1)), q[:, 0])[:, None]
+            q = raw_pose / raw_pose.norm(dim=1, keepdim=True).clamp_min(1e-8)
             cube_pose = quaternion_to_matrix(q)
         else:
-            cube_pose = euler_angles_to_matrix(cube_preds["pose"], "XYZ")
+            cube_pose = euler_angles_to_matrix(raw_pose, "XYZ")
 
         z_raw = cube_preds["z"]
-        if self.z_type == "clusters" and self.cluster_bins > 1:
-            src_scales = (src_h**2 + src_w**2).sqrt()
-            scales_diff = (self.priors_z_scales.T.unsqueeze(0) - src_scales.unsqueeze(1).unsqueeze(2)).abs()
+        if self.z_type == "clusters" and self.cluster_bins > 1 and bool(self.priors_initialized.item()):
+            src_scales = (src_h.square() + src_w.square()).sqrt()
+            scales_diff = (
+                self.priors_z_scales.T.unsqueeze(0)
+                - src_scales.unsqueeze(1).unsqueeze(2)
+            ).abs()
             assignments = scales_diff.argmin(1)
             assigned_bins = assignments[fg_inds, box_classes]
 
-            z_means = self.priors_z_stats[:, :, 0].T.unsqueeze(0).repeat([n, 1, 1])
-            z_means = torch.gather(z_means, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
-            z_stds = self.priors_z_stats[:, :, 1].T.unsqueeze(0).repeat([n, 1, 1])
-            z_stds = torch.gather(z_stds, 1, assignments.unsqueeze(1)).squeeze(1)[fg_inds, box_classes]
+            stats = self.priors_z_stats.detach()
+            z_means = torch.gather(
+                stats[:, :, 0].T.unsqueeze(0).expand(n, -1, -1), 1, assignments.unsqueeze(1)
+            ).squeeze(1)[fg_inds, box_classes]
+            z_stds = torch.gather(
+                stats[:, :, 1].T.unsqueeze(0).expand(n, -1, -1), 1, assignments.unsqueeze(1)
+            ).squeeze(1)[fg_inds, box_classes]
 
-            z_mins = (z_means - 3 * z_stds).clamp(min=0.0)
-            z_maxs = (z_means + 3 * z_stds)
-
-            z_sel = z_raw.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
-            cube_z = cubeutil.scaled_sigmoid(z_sel, min=z_mins, max=z_maxs)
-
+            z_mins = (z_means - 3 * z_stds).clamp_min(0.0)
+            z_maxs = z_means + 3 * z_stds
+            z_selected = z_raw.gather(1, assigned_bins.unsqueeze(1)).squeeze(1)
+            cube_z = cubeutil.scaled_sigmoid(z_selected, min=z_mins, max=z_maxs)
         elif self.z_type == "sigmoid":
-            cube_z = torch.sigmoid(z_raw[:, 0]) * 100
+            cube_z = torch.sigmoid(z_raw[:, 0]) * 100.0
         elif self.z_type == "log":
-            cube_z = torch.exp(z_raw[:, 0].clamp(min=-5, max=8))
+            cube_z = torch.exp(z_raw[:, 0].clamp(-5, 8))
         else:
             cube_z = z_raw[:, 0]
 
+        # 幾何解耦：確保尺度計算維持為 (N,) 的純量
         if self.virtual_depth:
+            h_orig = im_scales_orig[:, 0] if im_scales_orig.ndim == 2 else im_scales_orig
+            h_scale = im_scales[:, 0] if im_scales.ndim == 2 else im_scales
+            h_scaled = h_orig * h_scale
             virtual_to_real = cubeutil.compute_virtual_scale_from_focal_spaces(
                 focal_lengths,
-                im_scales_orig,
+                h_orig,
                 self.virtual_focal,
-                im_scales
+                h_scaled,
             )
             cube_z = cube_z * virtual_to_real
 
-        cube_x3d = cube_z * (cube_x - Ks_scaled_per_box[:, 0, 2]) / Ks_scaled_per_box[:, 0, 0]
-        cube_y3d = cube_z * (cube_y - Ks_scaled_per_box[:, 1, 2]) / Ks_scaled_per_box[:, 1, 1]
-        cube_center_cam = torch.stack([cube_x3d, cube_y3d, cube_z], dim=-1)
+        fx = Ks_scaled_per_box[:, 0, 0].clamp_min(1e-6)
+        fy = Ks_scaled_per_box[:, 1, 1].clamp_min(1e-6)
+        cube_x3d = cube_z * (cube_x - Ks_scaled_per_box[:, 0, 2]) / fx
+        cube_y3d = cube_z * (cube_y - Ks_scaled_per_box[:, 1, 2]) / fy
+        cube_center_cam = torch.stack((cube_x3d, cube_y3d, cube_z), dim=-1)
 
         if self.allocentric_pose:
-            cube_pose = cubeutil.R_from_allocentric(Ks_scaled_per_box, cube_pose, u=cube_x.detach(), v=cube_y.detach())
+            cube_pose = cubeutil.R_from_allocentric(
+                Ks_scaled_per_box,
+                cube_pose,
+                u=cube_x.detach(),
+                v=cube_y.detach(),
+            )
 
         out = {
             "center_cam": cube_center_cam,
@@ -575,19 +575,27 @@ class Detect3D(Detect):
             "dims": cube_dims,
             "pose": cube_pose,
             "z": cube_z,
-            "raw_dims": cube_preds["dims"],
+            "raw_dims": raw_dims,
             "raw_z": z_raw,
             "raw_deltas": cube_preds["deltas"],
         }
-
         if self.use_conf and "uncert" in cube_preds:
-            out["conf"] = torch.exp(-cube_preds["uncert"])
-
+            out["conf"] = torch.exp(-cube_preds["uncert"].clamp(-10, 10))
         return out
+
+    def _assert_anchor_alignment(self, branch: dict[str, Any]) -> None:
+        scores = branch["scores"]
+        num_anchors = scores.shape[-1] if scores.ndim == 3 else scores.shape[1]
+        for name, value in branch["cube_preds"].items():
+            if value.shape[1] != num_anchors:
+                raise RuntimeError(
+                    f"2D/3D anchor mismatch for {name}: 2D={num_anchors}, 3D={value.shape[1]}"
+                )
 
     def forward(self, x: list[torch.Tensor]):
         preds = self.forward_head(x, **self.one2many)
         preds["cube_preds"] = self.forward_cube(x, self.cv4, self.cube_branch)
+        self._assert_anchor_alignment(preds)
 
         has_o2o = getattr(self, "one2one_cv2", None) is not None
         one2one = None
@@ -597,20 +605,25 @@ class Detect3D(Detect):
             one2one["cube_preds"] = self.forward_cube(
                 x_o2o, self.one2one_cv4, self.one2one_cube_branch
             )
+            self._assert_anchor_alignment(one2one)
 
         if self.training:
-            return {"one2many": preds, "one2one": one2one} if has_o2o else preds
+            return {"one2many": preds, "one2one": one2one}
 
-        use_one2one = self.end2end and has_o2o
+        # Inference / Validation
+        # 若具備 one2one 分支則優先採用，達成 NMS-free 評估
+        use_one2one = (getattr(self, "end2end", False) or has_o2o) and (one2one is not None)
         base = one2one if use_one2one else preds
         y = self._inference(base)
 
-        if self.end2end:
-            y, cube_preds = self.postprocess(y.permute(0, 2, 1), base["cube_preds"])
-            raw = {"one2many": preds, "one2one": one2one} if has_o2o else preds
-            return (y, cube_preds) if self.export else (y, cube_preds, raw)
+        # 封裝雙分支特徵供 Validator 計算驗證損失
+        raw_dual = {"one2many": preds, "one2one": one2one} if has_o2o else preds
 
-        return (y, base["cube_preds"]) if self.export else (y, base["cube_preds"], preds)
+        # 修復關鍵：推論與驗證時一律調用 postprocess，將 (B, 42, 8400) 與 (B, 8400, D)
+        # 同步過濾至 [B, max_det, 6] 與 [B, max_det, D]
+        y_post, cube_preds_post = self.postprocess(y.permute(0, 2, 1), base["cube_preds"])
+        
+        return (y_post, cube_preds_post) if self.export else (y_post, cube_preds_post, raw_dual)
 
     def postprocess(
         self,
@@ -623,21 +636,18 @@ class Detect3D(Detect):
         )
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
         pred_2d = torch.cat(
-            [self._gather(boxes, idx), scores, conf, *(self._gather(e, idx) for e in extra)],
+            [
+                self._gather(boxes, idx),
+                scores,
+                conf,
+                *(self._gather(value, idx) for value in extra),
+            ],
             dim=-1,
         )
-        selected_cube = {name: self._gather(value, idx) for name, value in cube_preds.items()}
+        selected_cube = {
+            name: self._gather(value, idx) for name, value in cube_preds.items()
+        }
         return pred_2d, selected_cube
-
-    def fuse(self) -> None:
-        end2end = self.end2end
-        super().fuse()
-        if end2end:
-            self.cv4 = None
-            self.cube_branch = None
-        else:
-            self.one2one_cv4 = None
-            self.one2one_cube_branch = None
 
 class Segment(Detect):
     """YOLO Segment head for segmentation models.
