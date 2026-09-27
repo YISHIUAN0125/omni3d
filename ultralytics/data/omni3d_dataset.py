@@ -6,15 +6,16 @@ import os
 import random
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 import numpy as np
 import torch
-from typing import Any
 
 from ultralytics.utils.instance import Instances
+from ultralytics.utils.cube_utils import pick_2d_box, is_ignore
 from .augment import BaseTransform, Compose, Format, LetterBox
 from .base import BaseDataset
 
-CACHE_VERSION = "1.0.4"
+CACHE_VERSION = "1.0.6"
 
 DEFAULT_FILTER_SETTINGS = {
     "category_names": [],
@@ -130,8 +131,8 @@ class Albumentations3D(BaseTransform):
             for t in T:
                 if isinstance(t, A.DualTransform):
                     raise ValueError(
-                        f"[Albumentations3D] Detect spatial transformation operater: {t.__class__.__name__}。"
-                        "Please dont use it in albumentation"
+                        f"[Albumentations3D] 檢測到空間幾何變換算子: {t.__class__.__name__}。"
+                        "在 3D 任務中請勿混入空間算子，以避免破壞相機內參 K！"
                     )
 
             self.transform = A.Compose(T)
@@ -149,61 +150,6 @@ class Albumentations3D(BaseTransform):
         labels["img"] = self.transform(image=im)["image"]
         return labels
 
-# -------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------
-def _xyxy_to_xywh(box):
-    x1, y1, x2, y2 = box
-    return [x1, y1, x2 - x1, y2 - y1]
-
-def _pick_2d_box(anno: dict, filter_settings: dict):
-    tight = anno.get("bbox2D_tight")
-    if filter_settings.get("modal_2D_boxes") and tight and tight[0] != -1:
-        return _xyxy_to_xywh(tight)
-
-    trunc = anno.get("bbox2D_trunc")
-    if filter_settings.get("trunc_2D_boxes") and trunc and not all(v == -1 for v in trunc):
-        return _xyxy_to_xywh(trunc)
-
-    proj = anno.get("bbox2D_proj")
-    if proj and proj[0] != -1:
-        return _xyxy_to_xywh(proj)
-
-    return anno.get("bbox")
-
-def compute_ignore_flag(anno: dict, filter_settings: dict, image_height: int) -> bool:
-    if anno.get("behind_camera") or not bool(anno.get("valid3D", True)):
-        return True
-
-    dims = anno["dimensions"]
-    if dims[0] <= 0 or dims[1] <= 0 or dims[2] <= 0:
-        return True
-    if anno["center_cam"][2] > filter_settings["max_depth"]:
-        return True
-    if anno.get("lidar_pts", 1) == 0 or anno.get("segmentation_pts", 1) == 0:
-        return True
-    if anno.get("depth_error", 0) > 0.5:
-        return True
-
-    box2d = _pick_2d_box(anno, filter_settings)
-    if box2d is None:
-        return True
-    box_h = box2d[3]
-    if box_h <= filter_settings["min_height_thres"] * image_height:
-        return True
-    if box_h >= filter_settings["max_height_thres"] * image_height:
-        return True
-
-    trunc = anno.get("truncation", -1)
-    if trunc >= 0 and trunc >= filter_settings["truncation_thres"]:
-        return True
-    vis = anno.get("visibility", -1)
-    if vis >= 0 and vis <= filter_settings["visibility_thres"]:
-        return True
-    if anno.get("category_name") in filter_settings.get("ignore_names", []):
-        return True
-
-    return False
 
 def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset_idx: int = 0) -> dict:
     with open(json_file) as f:
@@ -218,7 +164,7 @@ def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset
     ann_image_idx, ann_cat_id = [], []
     ann_bbox, ann_dims, ann_center, ann_R, ann_center2d, ann_ignore = [], [], [], [], [], []
 
-    # ID shift
+    # ID shift 避免多資料集碰撞
     id_offset = dataset_idx * 1_000_000
 
     for img_idx, im in enumerate(images):
@@ -233,8 +179,13 @@ def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset
             if cat_id not in id_map and anno.get("category_name") not in filter_settings.get("ignore_names", []):
                 continue
 
-            box2d = _pick_2d_box(anno, filter_settings)
-            if box2d is None:
+            box2d = pick_2d_box(anno, filter_settings)
+            # 剔除無效的 2D 框結構
+            if box2d is None or len(box2d) != 4:
+                continue
+
+            # 寬或高小於等於 0，直接略過
+            if box2d[2] <= 0.0 or box2d[3] <= 0.0:
                 continue
 
             cx3d, cy3d, z3d = anno["center_cam"]
@@ -244,10 +195,18 @@ def _parse_one_json(json_file: str, filter_settings: dict, id_map: dict, dataset
             proj_y = k_img[1][1] * cy3d / safe_z + k_img[1][2]
             center_2d = [proj_x, proj_y]
 
-            ignore = compute_ignore_flag(anno, filter_settings, im["height"])
+            ignore = is_ignore(anno, filter_settings, im["height"])
+
+            # 防禦：退化框（寬或高小於 2 像素）標記為 ignore，避免邊界孤立標籤
+            if box2d[2] < 12.0 or box2d[3] < 12.0:
+                ignore = True
+
+            mapped_cat_id = id_map.get(cat_id, -1)
+            if mapped_cat_id < 0:
+                ignore = True
 
             ann_image_idx.append(img_idx)
-            ann_cat_id.append(-1 if ignore else id_map[cat_id])
+            ann_cat_id.append(-1 if ignore else mapped_cat_id)
             ann_bbox.append(box2d)
             ann_dims.append(anno["dimensions"])
             ann_center.append(anno["center_cam"])
@@ -322,7 +281,17 @@ class Omni3DDataset(BaseDataset):
 
             for img_idx in range(len(arrs["file_path"])):
                 idxs = by_img.get(img_idx, [])
-                has_valid = any(not arrs["ann_ignore"][i] for i in idxs)
+                
+                # 關鍵落實：只有具備「非 ignore、類別合法、寬高 >= 2」的有效目標時，才算有效影像
+                has_valid = any(
+                    (not arrs["ann_ignore"][i])
+                    and (arrs["ann_cat_id"][i] >= 0)
+                    and (arrs["ann_bbox"][i][2] >= 12.0)
+                    and (arrs["ann_bbox"][i][3] >= 12.0)
+                    for i in idxs
+                )
+                
+                # 當開啟 filter_empty 時，徹底排除純背景影像
                 if self.filter_empty and not has_valid:
                     continue
 
@@ -352,9 +321,11 @@ class Omni3DDataset(BaseDataset):
             n = len(e["bbox"])
             if n:
                 x, y, w, h = e["bbox"][:, 0], e["bbox"][:, 1], e["bbox"][:, 2], e["bbox"][:, 3]
-                cx = (x + w / 2) / e["width"]
-                cy = (y + h / 2) / e["height"]
-                bboxes = np.stack([cx, cy, w / e["width"], h / e["height"]], axis=1).astype(np.float32)
+                cx = np.clip((x + w / 2.0) / e["width"], 0.0, 1.0)
+                cy = np.clip((y + h / 2.0) / e["height"], 0.0, 1.0)
+                w_norm = np.clip(w / e["width"], 0.0, 1.0)
+                h_norm = np.clip(h / e["height"], 0.0, 1.0)
+                bboxes = np.stack([cx, cy, w_norm, h_norm], axis=1).astype(np.float32)
             else:
                 bboxes = np.zeros((0, 4), np.float32)
 
@@ -383,9 +354,8 @@ class Omni3DDataset(BaseDataset):
         return label
 
     def build_transforms(self, hyp=None):
-        # TODO expose Albumentations3D possibility to yaml 
         transforms = Compose([
-            Albumentations3D(p=self.fliplr_p),
+            Albumentations3D(p=1.0 if self.augment else 0.0),
             RandomFlip3D(p=self.fliplr_p if self.augment else 0.0, mirror_center_x=self.mirror_center_x),
             LetterBox3D(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment),
         ])
