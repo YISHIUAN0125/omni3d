@@ -10,10 +10,19 @@ test: SUNRGBD_test.json
 train_json:
   - datasets/Omni3D/SUNRGBD_train.json
   - datasets/Omni3D/SUNRGBD_val.json
+  - datasets/Omni3D/Hypersim_train.json
+  - datasets/Omni3D/Hypersim_val.json
+  - datasets/Omni3D/ARKitScenes_train.json
+  - datasets/Omni3D/ARKitScenes_val.json
 val_json:
   - datasets/Omni3D/SUNRGBD_test.json
+  - datasets/Omni3D/Hypersim_test.json
+  - datasets/Omni3D/ARKitScenes_test.json
 test_json:
   - datasets/Omni3D/SUNRGBD_test.json
+  - datasets/Omni3D/Hypersim_test.json
+  - datasets/Omni3D/ARKitScenes_test.json
+  
 nc: 38
 channels: 3
 
