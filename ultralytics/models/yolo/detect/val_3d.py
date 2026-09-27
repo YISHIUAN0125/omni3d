@@ -12,10 +12,10 @@ from pycocotools.coco import COCO
 
 from ultralytics.engine.validator import BaseValidator
 from ultralytics.utils import LOGGER, RANK, ops
-from cubercnn import util as cubeutil
 import cubercnn.vis.logperf as utils_logperf
 from collections import OrderedDict, abc
 import logging, sys
+from ultralytics.utils.cube_utils import get_cuboid_verts_faces
 
 # 關鍵：配置 cubercnn 日誌流，確保 logperf 產出的四張大表直接輸出至終端控制台
 _c_logger = logging.getLogger("cubercnn")
@@ -292,7 +292,7 @@ class Detection3DValidator(BaseValidator):
             decoded = self._decode_image(pred, batch, image_index)
             boxes3d = torch.cat((decoded["center_cam"], decoded["dims"]), dim=1)
 
-            vertices, _ = cubeutil.get_cuboid_verts_faces_(boxes3d, decoded["pose"])
+            vertices, _ = get_cuboid_verts_faces(boxes3d, decoded["pose"])
 
             scale = batch["im_scales_orig"][image_index]
             ori_shape = (int(scale[0]), int(scale[1]))

@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import torch
 from torch import nn
-from cubercnn import util as cubeutil
+from ultralytics.utils.cube_utils import get_cuboid_verts_faces
 
 try:
     from mgiou import MGIoU3D
@@ -132,7 +132,7 @@ class CubeMGIoUQualityBuilder(nn.Module):
             im_scales=batch["im_scales"].to(device)[batch_idx],
         )
         pred_box3d = torch.cat([decoded["center_cam"], decoded["dims"]], dim=-1)
-        pred_corners = cubeutil.get_cuboid_verts_faces_(pred_box3d, decoded["pose"])[0]
+        pred_corners = get_cuboid_verts_faces(pred_box3d, decoded["pose"])[0]
 
         packed_boxes, packed_poses, packed_centers = self._pack_flat_gt(
             batch, batch_size, max_gt, device
@@ -143,7 +143,7 @@ class CubeMGIoUQualityBuilder(nn.Module):
         # Avoid reconstructing X/Y from projected pixels, which can introduce
         # LetterBox, flip, and pixel-rounding inconsistencies.
         gt_box_cam = pair_gt[:, :6]
-        gt_corners = cubeutil.get_cuboid_verts_faces_(gt_box_cam, pair_gt_pose)[0]
+        gt_corners = get_cuboid_verts_faces(gt_box_cam, pair_gt_pose)[0]
 
         pred_corners = self._reorder(pred_corners).float()
         gt_corners = self._reorder(gt_corners).float()

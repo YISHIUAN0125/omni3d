@@ -16,6 +16,7 @@ from ultralytics.utils.metrics import CITYSCAPES_WEIGHT, OKS_SIGMA, RLE_WEIGHT
 from ultralytics.utils.ops import crop_mask, xywh2xyxy, xyxy2xywh
 from ultralytics.utils.tal import RotatedTaskAlignedAssigner, TaskAlignedAssigner, TaskAlignedAssigner3D, dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import autocast
+from ultralytics.utils.cube_utils import get_cuboid_verts_faces
 
 from pytorch3d.transforms.rotation_conversions import _copysign
 from pytorch3d.transforms import rotation_6d_to_matrix, euler_angles_to_matrix, quaternion_to_matrix
@@ -563,25 +564,25 @@ class CubeLoss(nn.Module):
         gt_box3d = torch.cat([gt_3d, gt_dims], dim=1)
 
         if self.disentangled_loss:
-            gt_corners = cubeutil.get_cuboid_verts_faces_(gt_box3d, gt_pose)[0]
+            gt_corners = get_cuboid_verts_faces(gt_box3d, gt_pose)[0]
 
             dis_x_from_z = pred_z * (gt_2d[..., 0] - Ks[..., 0, 2]) / Ks[..., 0, 0]
             dis_y_from_z = pred_z * (gt_2d[..., 1] - Ks[..., 1, 2]) / Ks[..., 1, 1]
             dis_z_box = torch.cat([torch.stack([dis_x_from_z, dis_y_from_z, pred_z], dim=1), gt_dims], dim=1)
-            dis_z_corners = cubeutil.get_cuboid_verts_faces_(dis_z_box, gt_pose)[0]
+            dis_z_corners = get_cuboid_verts_faces(dis_z_box, gt_pose)[0]
             loss_z = self.l1_loss(dis_z_corners, gt_corners).reshape(n_fg, -1).mean(1)
 
             dis_x_from_xy = gt_z * (pred_x - Ks[..., 0, 2]) / Ks[..., 0, 0]
             dis_y_from_xy = gt_z * (pred_y - Ks[..., 1, 2]) / Ks[..., 1, 1]
             dis_xy_box = torch.cat([torch.stack([dis_x_from_xy, dis_y_from_xy, gt_z], dim=1), gt_dims], dim=1)
-            dis_xy_corners = cubeutil.get_cuboid_verts_faces_(dis_xy_box, gt_pose)[0]
+            dis_xy_corners = get_cuboid_verts_faces(dis_xy_box, gt_pose)[0]
             loss_xy = self.l1_loss(dis_xy_corners, gt_corners).reshape(n_fg, -1).mean(1)
 
             dis_dims_box = torch.cat([gt_3d, pred_dims], dim=1)
-            dis_dims_corners = cubeutil.get_cuboid_verts_faces_(dis_dims_box, gt_pose)[0]
+            dis_dims_corners = get_cuboid_verts_faces(dis_dims_box, gt_pose)[0]
             loss_dims = self.l1_loss(dis_dims_corners, gt_corners).reshape(n_fg, -1).mean(1)
 
-            dis_pose_corners = cubeutil.get_cuboid_verts_faces_(gt_box3d, pred_pose)[0]
+            dis_pose_corners = get_cuboid_verts_faces(gt_box3d, pred_pose)[0]
             if self.chamfer_pose:
                 loss_pose = self.chamfer_loss(dis_pose_corners, gt_corners)
             else:
@@ -639,8 +640,8 @@ class CubeLoss(nn.Module):
         loss_joint = torch.zeros(n_fg, device=device)
         if self.loss_w_joint > 0:
             pred_box3d = torch.cat([cube_decoded["center_cam"], pred_dims], dim=1)
-            pred_corners = cubeutil.get_cuboid_verts_faces(pred_box3d, pred_pose)[0]
-            gt_corners = cubeutil.get_cuboid_verts_faces(gt_box3d, gt_pose)[0]
+            pred_corners = get_cuboid_verts_faces(pred_box3d, pred_pose)[0]
+            gt_corners = get_cuboid_verts_faces(gt_box3d, gt_pose)[0]
             loss_joint = self.l1_loss(pred_corners, gt_corners).reshape(n_fg, -1).mean(1)
 
         if self.inverse_z_weight:
