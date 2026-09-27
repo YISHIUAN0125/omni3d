@@ -20,13 +20,10 @@ import ultralytics.utils.plotting as ul_plot
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import strip_optimizer, torch_distributed_zero_first, unwrap_model
-
-from .train_omni3d_util import build_id_map
-from ultralytics.utils.cube_utils import compute_priors, Omni3DPriorDatasetAdapter, make_cfg
+from ultralytics.utils.cube_utils import build_id_map, compute_priors, Omni3DPriorDatasetAdapter, make_cfg
 
 
 def plot_results_3d(file="path/to/results.csv", dir="", on_plot=None):
-    """自適應動態網格繪圖，支援 30+ 個 3D 欄位，徹底解決 28-axis 越界錯誤。"""
     import pandas as pd
     import matplotlib.pyplot as plt
 
@@ -66,8 +63,7 @@ def plot_results_3d(file="path/to/results.csv", dir="", on_plot=None):
     except Exception as e:
         LOGGER.warning(f"[Plotting] Failed to plot 3D results: {e}")
 
-
-# 全局替換繪圖函式，攔截所有回呼 (Callbacks)
+# Replace plotting function
 ul_plot.plot_results = plot_results_3d
 
 
@@ -129,9 +125,10 @@ class Detection3DTrainer(DetectionTrainer):
     ):
         overrides = dict(overrides or {})
 
-        # 關鍵修復：在交給父類別前先 pop 掉自定義參數，避開 check_dict_alignment 白名單檢查
+        # Trick: pop custom arg when 
         self.custom_val_period = overrides.pop("val_period", None)
 
+        # TODO implement multiscale
         if float(overrides.get("multi_scale", 0.0) or 0.0) > 0:
             raise ValueError(
                 "Native multi_scale does not synchronize camera matrices (K). Set multi_scale=0.0."
@@ -212,7 +209,7 @@ class Detection3DTrainer(DetectionTrainer):
             return
 
         if getattr(head, "priors_initialized", torch.tensor(False)).item():
-            LOGGER.info("[Detect3D] 先驗已存在於載入的權重中，跳過注入。")
+            LOGGER.info("[Detect3D] Priors are existed in weights skip injection")
             return
 
         priors_source = (
@@ -233,7 +230,7 @@ class Detection3DTrainer(DetectionTrainer):
                     if "priors_dims_per_cat" in raw:
                         priors_data = raw
                     else:
-                        LOGGER.info(f"[Detect3D] 檢測到 stats.json ({p_path.name})，正在計算先驗...")
+                        LOGGER.info(f"[Detect3D] Find stats.json ({p_path.name}), computing priors...")
                         train_jsons = self._json_files("train", self.data.get("path", ""))
                         filter_settings = dict(self.data.get("filter_settings") or {})
                         adapter = Omni3DPriorDatasetAdapter(train_jsons, self._id_map(), filter_settings)
@@ -250,14 +247,14 @@ class Detection3DTrainer(DetectionTrainer):
                         cat_names = [self.data["names"][i] for i in range(self.data["nc"])]
                         priors_data = compute_priors(prior_cfg, adapter, cat_names)
             except Exception as e:
-                LOGGER.warning(f"[Detect3D] 讀取先驗失敗: {e}，跳過 set_priors。")
+                LOGGER.warning(f"[Detect3D] Priors not found: {e}, skip set_priors。")
                 priors_data = None
 
         if priors_data is not None:
             head.set_priors(priors_data)
-            LOGGER.info("[Detect3D] 成功載入並設定先驗。")
+            LOGGER.info("[Detect3D] Load prior successfully")
         else:
-            LOGGER.info("[Detect3D] 未提供有效先驗檔案，平滑關閉先驗引導。")
+            LOGGER.info("[Detect3D] Priors are unavailable, skip prior injection")
             head.disable_priors()
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None):
