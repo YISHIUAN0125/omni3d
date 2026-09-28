@@ -455,3 +455,40 @@ def get_cuboid_verts_faces(box3d=None, R=None):
         faces = faces.squeeze(0)
 
     return verts, faces
+
+
+CUBOID_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),   # z = -w/2 面
+    (4, 5), (5, 6), (6, 7), (7, 4),   # z = +w/2 面
+    (0, 4), (1, 5), (2, 6), (3, 7),   # 連接兩面
+]
+
+
+def cuboid_corners(center, dims, R):
+    """
+    center: (N,3) [X,Y,Z]；dims: (N,3) [W,H,L]；R: (N,3,3)
+    回傳相機座標系下的 8 個頂點 (N,8,3)。
+    """
+    center = to_float_tensor(center).reshape(-1, 3)
+    dims = to_float_tensor(dims).reshape(-1, 3)
+    R = to_float_tensor(R).reshape(-1, 3, 3)
+    box3d = torch.cat([center, dims], dim=1)          # [X Y Z W H L]
+    verts, _ = get_cuboid_verts_faces(box3d, R)
+    return verts
+
+
+def project_points(K, pts):
+    """K: (3,3)；pts: (...,3) 相機座標 -> (...,2) 像素座標。"""
+    K = to_float_tensor(K)
+    pts = to_float_tensor(pts)
+    uvw = pts @ K.T
+    return uvw[..., :2] / uvw[..., 2:].clamp(min=1e-3)
+
+
+def box_iou_xyxy(a, b) -> float:
+    """兩個 xyxy 框的 IoU（純 Python 數值）。"""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
