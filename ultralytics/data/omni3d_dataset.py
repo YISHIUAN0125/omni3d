@@ -53,7 +53,10 @@ class RandomFlip3D(BaseTransform):
         img = labels["img"]
         w = img.shape[1]
         labels["img"] = np.ascontiguousarray(img[:, ::-1])
-        labels["instances"].fliplr(w)
+
+        # Use normalized image to flip
+        inst = labels["instances"]
+        inst.fliplr(1 if inst.normalized else w)
 
         K = labels["K"].copy()
         K[0, 2] = w - K[0, 2]
