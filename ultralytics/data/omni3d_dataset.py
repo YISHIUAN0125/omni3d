@@ -326,14 +326,20 @@ class Omni3DDataset(BaseDataset):
     def get_labels(self):
         labels = []
         for i, e in enumerate(self._entries):
-            n = len(e["bbox"])
-            if n:
-                x, y, w, h = e["bbox"][:, 0], e["bbox"][:, 1], e["bbox"][:, 2], e["bbox"][:, 3]
-                cx = np.clip((x + w / 2.0) / e["width"], 0.0, 1.0)
-                cy = np.clip((y + h / 2.0) / e["height"], 0.0, 1.0)
-                w_norm = np.clip(w / e["width"], 0.0, 1.0)
-                h_norm = np.clip(h / e["height"], 0.0, 1.0)
-                bboxes = np.stack([cx, cy, w_norm, h_norm], axis=1).astype(np.float32)
+            W, H = float(e["width"]), float(e["height"])
+            cls = e["cls"].copy()
+            ignore = e["ignore"].copy()
+            if len(e["bbox"]):
+                x, y, w, h = e["bbox"].T
+                x1, y1 = np.clip(x, 0, W), np.clip(y, 0, H)
+                x2, y2 = np.clip(x + w, 0, W), np.clip(y + h, 0, H)
+                cw, ch = x2 - x1, y2 - y1
+                degenerate = (cw < 2) | (ch < 2)
+                ignore |= degenerate
+                cls[degenerate] = -1
+                bboxes = np.stack(
+                    [(x1 + x2) / 2 / W, (y1 + y2) / 2 / H, cw / W, ch / H], 1
+                ).astype(np.float32)
             else:
                 bboxes = np.zeros((0, 4), np.float32)
 
@@ -341,8 +347,9 @@ class Omni3DDataset(BaseDataset):
                 "im_file": self.im_files[i],
                 "shape": (e["height"], e["width"]),
                 "image_id": e["image_id"],
-                "cls": e["cls"],
+                "cls": cls,
                 "bboxes": bboxes,
+                "ignore": ignore,
                 "normalized": True,
                 "bbox_format": "xywh",
                 "K": e["K"],
@@ -350,7 +357,6 @@ class Omni3DDataset(BaseDataset):
                 "center_cam": e["center_cam"],
                 "R_cam": e["R_cam"],
                 "center_2D": e["center_2D"],
-                "ignore": e["ignore"],
                 "K_orig": e["K"].copy(),
                 "im_scales_orig": np.array([e["height"], e["width"]], dtype=np.float32),
             })
