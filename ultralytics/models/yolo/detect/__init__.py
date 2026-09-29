@@ -6,5 +6,6 @@ from .val import DetectionValidator
 
 from .train_3d import Detection3DTrainer
 from .val_3d import Detection3DValidator
+from .predict_3d import Detection3DPredictor
 
-__all__ = "DetectionPredictor", "DetectionTrainer", "DetectionValidator", "Detection3DTrainer", "Detection3DValidator"
+__all__ = "DetectionPredictor", "DetectionTrainer", "DetectionValidator", "Detection3DTrainer", "Detection3DValidator", "Detection3DPredictor"

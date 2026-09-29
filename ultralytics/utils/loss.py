@@ -518,6 +518,7 @@ class CubeLoss(nn.Module):
         self.loss_w_z = getattr(model_head, "loss_w_z", 1.0)
         self.loss_w_dims = getattr(model_head, "loss_w_dims", 1.0)
         self.loss_w_pose = getattr(model_head, "loss_w_pose", 1.0)
+        self.loss_w_uncert = getattr(model_head, "loss_w_uncert", 1.0)
         self.loss_w_joint = getattr(model_head, "loss_w_joint", 0.0)
         self.inverse_z_weight = getattr(model_head, "inverse_z_weight", False)
 
@@ -536,6 +537,16 @@ class CubeLoss(nn.Module):
     @staticmethod
     def l1_loss(vals: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return F.smooth_l1_loss(vals, target, reduction="none", beta=0.0)
+
+    @staticmethod
+    def _safe_weighted_mean(loss: torch.Tensor, weight: torch.Tensor, denom: torch.Tensor) -> torch.Tensor:
+        valid = torch.isfinite(loss)
+        if not valid.any():
+            loss.sum() * 0.0
+        loss = torch.where(valid, loss, torch.zeros_like(loss))
+        w = torch.where(valid, weight, torch.zeros_like(weight))
+        denom_safe = w.sum().clamp_min(1e-8)
+        return (loss * w).sum() / denom_safe
 
     def forward(
         self, cube_preds, cube_decoded, gt_box3d, gt_pose, gt_2d,
@@ -666,14 +677,19 @@ class CubeLoss(nn.Module):
             loss_uncert = uncert
 
         weight = weight.squeeze(-1)
-        l_xy = (loss_xy * weight).sum() / target_scores_sum * self.loss_w_xy
-        l_dims = (loss_dims * weight).sum() / target_scores_sum * self.loss_w_dims
-        l_z = (loss_z * weight).sum() / target_scores_sum * self.loss_w_z
-        l_pose = (loss_pose * weight).sum() / target_scores_sum * self.loss_w_pose
-        l_joint = (loss_joint * weight).sum() / target_scores_sum * self.loss_w_joint
-        l_uncert = (loss_uncert * weight).sum() / target_scores_sum if self.use_conf else gt_box3d.sum() * 0.0
+        l_xy = self._safe_weighted_mean(loss_xy, weight, target_scores_sum) * self.loss_w_xy
+        l_dims = self._safe_weighted_mean(loss_dims, weight, target_scores_sum) * self.loss_w_dims
+        l_z = self._safe_weighted_mean(loss_z, weight, target_scores_sum) * self.loss_w_z
+        l_pose = self._safe_weighted_mean(loss_pose, weight, target_scores_sum) * self.loss_w_pose
+        l_joint = self._safe_weighted_mean(loss_joint, weight, target_scores_sum) * self.loss_w_joint
 
-        total_3d_loss = (l_xy + l_dims + l_z + l_pose + l_joint + l_uncert) * self.loss_w_3d
+        if self.use_conf and "uncert" in cube_preds:
+            valid_u = torch.isfinite(loss_uncert)
+            l_uncert = (loss_uncert[valid_u].mean() if valid_u.any() else loss_uncert.sum() * 0.0) * self.loss_w_uncert
+        else:
+            l_uncert = gt_box3d.sum() * 0.0
+
+        total_3d_loss = (l_xy + l_dims + l_z + l_pose + l_joint) * self.loss_w_3d + l_uncert
 
         loss_items = {
             "loss_3d_xy": l_xy.detach(),
@@ -747,7 +763,6 @@ class Detect3DLoss:
         offsets = offsets.cumsum(0)
         within_idx = torch.arange(nl, device=self.device) - offsets[batch_idx]
         out[batch_idx, within_idx] = targets[:, 1:]
-        # out[..., 1:5] = cubeutil.xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 

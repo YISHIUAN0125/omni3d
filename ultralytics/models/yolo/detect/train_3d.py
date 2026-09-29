@@ -22,7 +22,75 @@ import ultralytics.utils.plotting as ul_plot
 from ultralytics.utils.checks import check_file
 from ultralytics.utils.plotting import plot_images, plot_labels
 from ultralytics.utils.torch_utils import strip_optimizer, torch_distributed_zero_first, unwrap_model
-from ultralytics.utils.cube_utils import build_id_map, compute_priors, Omni3DPriorDatasetAdapter, make_cfg
+from ultralytics.utils.cube_utils import (build_id_map, compute_priors, Omni3DPriorDatasetAdapter, make_cfg, 
+cuboid_corners, project_points, box_iou_xyxy, CUBOID_EDGES)
+
+import cv2
+import numpy as np
+import torch
+from pathlib import Path
+
+def _to_cpu(x, dtype=None):
+    """tensor / ndarray / list 統一轉成 CPU tensor。"""
+    if isinstance(x, torch.Tensor):
+        t = x.detach().cpu()
+    else:
+        t = torch.as_tensor(np.asarray(x))
+    return t.to(dtype) if dtype is not None else t
+
+@torch.no_grad()
+def plot_3d_batch(batch, fname, max_imgs=16, ncols=4):
+    imgs = _to_cpu(batch["img"]).float()
+    if imgs.max() <= 1.0:
+        imgs = imgs * 255
+    imgs = imgs.clamp(0, 255).byte()
+    B, _, H, W = imgs.shape
+
+    bidx = _to_cpu(batch["batch_idx"], torch.long)
+    cls = _to_cpu(batch["cls"], torch.float32).view(-1)
+    bxs = _to_cpu(batch["bboxes"], torch.float32)           # normalized xywh
+    K_all = _to_cpu(batch["K"], torch.float32)
+    c3d = _to_cpu(batch["center_cam"], torch.float32)
+    dims = _to_cpu(batch["dimensions"], torch.float32)
+    R = _to_cpu(batch["R_cam"], torch.float32)
+    c2d = _to_cpu(batch["center_2D"], torch.float32)
+
+    tiles = []
+    for i in range(min(B, max_imgs)):
+        im = np.ascontiguousarray(imgs[i].permute(1, 2, 0).numpy())   # RGB
+        name = Path(batch["im_file"][i]).name if "im_file" in batch else str(i)
+        cv2.putText(im, name[:28], (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        m = bidx == i
+        if m.any():
+            K = K_all[i]
+            corners = cuboid_corners(c3d[m], dims[m], R[m])
+            for j, (cx, cy, bw, bh) in enumerate(bxs[m].tolist()):
+                x1, y1, x2, y2 = (cx-bw/2)*W, (cy-bh/2)*H, (cx+bw/2)*W, (cy+bh/2)*H
+                cv2.rectangle(im, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 1)   # 2D GT 綠
+
+                cor = corners[j]
+                if (cor[:, 2] <= 0.1).any():           # 有角點在相機後方
+                    continue
+                uv = project_points(K, cor).numpy()
+                for a, b in CUBOID_EDGES:
+                    cv2.line(im, tuple(uv[a].astype(int)), tuple(uv[b].astype(int)), (255, 128, 0), 1)  # 3D 橘
+
+                pbox = [uv[:, 0].min(), uv[:, 1].min(), uv[:, 0].max(), uv[:, 1].max()]
+                iou = box_iou_xyxy(pbox, [x1, y1, x2, y2])
+
+                rc = project_points(K, c3d[m][j][None])[0]                 # 用 K 重投影中心
+                err = (rc - c2d[m][j]).norm().item()
+                cv2.circle(im, tuple(c2d[m][j].numpy().astype(int)), 3, (255, 0, 0), -1)   # center_2D 紅
+                cv2.circle(im, tuple(rc.numpy().astype(int)), 2, (0, 0, 255), -1)          # 重投影 藍
+                cv2.putText(im, f"{int(cls[m][j])} iou{iou:.2f} e{err:.1f}",
+                            (int(x1), max(int(y1) - 3, 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        tiles.append(im)
+
+    while len(tiles) % ncols:
+        tiles.append(np.zeros_like(tiles[0]))
+    rows = [np.concatenate(tiles[r*ncols:(r+1)*ncols], 1) for r in range(len(tiles)//ncols)]
+    cv2.imwrite(str(fname), cv2.cvtColor(np.concatenate(rows, 0), cv2.COLOR_RGB2BGR))
 
 
 def plot_results_3d(file="path/to/results.csv", dir="", on_plot=None):
@@ -409,6 +477,7 @@ class Detection3DTrainer(DetectionTrainer):
     def plot_training_samples(self, batch: dict[str, Any], ni: int) -> None:
         if "im_file" not in batch:
             return
+        plot_3d_batch(batch, self.save_dir / f"train_batch{ni}_3d.jpg")
         plot_images(
             labels=batch,
             paths=batch["im_file"],

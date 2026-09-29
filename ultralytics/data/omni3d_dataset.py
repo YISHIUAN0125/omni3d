@@ -39,6 +39,24 @@ _FLIP_M2 = np.array([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=np.float32)
 def mirror_rotation(R: np.ndarray) -> np.ndarray:
     return _FLIP_M1 @ R @ _FLIP_M2
 
+class SyncLoadResize3D(BaseTransform):
+    """把 K / center_2D 從原圖座標同步到 load_image 縮放後的影像座標。必須放在 Compose 第一個。"""
+    def __call__(self, labels: dict) -> dict:
+        h, w = labels["img"].shape[:2]
+        H0, W0 = labels["ori_shape"][:2]
+        sx, sy = w / W0, h / H0
+        if abs(sx - 1) > 1e-6 or abs(sy - 1) > 1e-6:
+            K = labels["K"].copy()
+            K[0] *= sx          # fx, skew, cx
+            K[1] *= sy          # fy, cy
+            labels["K"] = K
+            c2d = labels.get("center_2D")
+            if c2d is not None and len(c2d):
+                c2d = c2d.copy()
+                c2d[:, 0] *= sx
+                c2d[:, 1] *= sy
+                labels["center_2D"] = c2d
+        return labels
 
 class RandomFlip3D(BaseTransform):
     """Horizontal flip with image and 2D/3D annotation"""
@@ -84,6 +102,7 @@ class LetterBox3D(LetterBox):
     """Pad image and annotations to target size"""
     def __call__(self, labels: dict) -> dict:
         h0, w0 = labels["img"].shape[:2]
+        H_orig, W_orig = labels["ori_shape"][:2]
         labels = super().__call__(labels)
 
         new_h, new_w = self.new_shape if isinstance(self.new_shape, tuple) else (self.new_shape, self.new_shape)
@@ -108,7 +127,10 @@ class LetterBox3D(LetterBox):
             center_2d[:, 1] = center_2d[:, 1] * r + top
             labels["center_2D"] = center_2d
 
-        labels["im_scales"] = np.array([r, r], dtype=np.float32)
+        # labels["im_scales"] = np.array([r, r], dtype=np.float32)
+        labels["im_scales"] = np.array(
+        [r * h0 / H_orig, r * w0 / W_orig], dtype=np.float32)
+
         return labels
 
 
@@ -369,6 +391,7 @@ class Omni3DDataset(BaseDataset):
 
     def build_transforms(self, hyp=None):
         transforms = Compose([
+            SyncLoadResize3D(),
             Albumentations3D(p=1.0 if self.augment else 0.0),
             RandomFlip3D(p=self.fliplr_p if self.augment else 0.0, mirror_center_x=self.mirror_center_x),
             LetterBox3D(new_shape=(self.imgsz, self.imgsz), scaleup=self.augment),
