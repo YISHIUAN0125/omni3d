@@ -102,6 +102,7 @@ class LetterBox3D(LetterBox):
     """Pad image and annotations to target size"""
     def __call__(self, labels: dict) -> dict:
         h0, w0 = labels["img"].shape[:2]
+        H_orig, W_orig = labels["ori_shape"][:2]
         labels = super().__call__(labels)
 
         new_h, new_w = self.new_shape if isinstance(self.new_shape, tuple) else (self.new_shape, self.new_shape)
@@ -126,7 +127,10 @@ class LetterBox3D(LetterBox):
             center_2d[:, 1] = center_2d[:, 1] * r + top
             labels["center_2D"] = center_2d
 
-        labels["im_scales"] = np.array([r, r], dtype=np.float32)
+        # labels["im_scales"] = np.array([r, r], dtype=np.float32)
+        labels["im_scales"] = np.array(
+        [r * h0 / H_orig, r * w0 / W_orig], dtype=np.float32)
+
         return labels
 
 
